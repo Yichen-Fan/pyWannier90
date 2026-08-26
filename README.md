@@ -102,8 +102,8 @@ CC=gcc FC=mpifort ./scripts/install_pywannier90_mpi.sh \
 
 source "$HOME/.local/wannier90-dlwf-4.0-mpi/activate-wannier90-mpi.sh"
 
-# Run the PySCF interface with the MPI library.
-mpiexec -n 4 python your_calculation.py
+# Run the bundled PySCF/DLWF example with the MPI library.
+mpiexec -n 4 python pyWannier90/examples/PySCF/h2_v4.py
 
 # Or run the standalone Wannier90 executable.
 mpiexec -n 4 wannier90.x seedname
