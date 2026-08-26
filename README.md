@@ -23,6 +23,72 @@ disentanglement, Wannierization, centers, spreads, and Wannier-gauge
 Hamiltonians. Spinor wavefunctions are not yet supported. Wannier90 v4 itself
 does not currently allow `gamma_only` with space-energy localization.
 
+### Recommended installation from the Wannier90 DLWF fork
+
+When pyWannier90 is checked out as the submodule of the
+[`Yichen-Fan/wannier90`](https://github.com/Yichen-Fan/wannier90/tree/dlwf)
+`dlwf` branch, the parent repository provides a tested setup script. Start in
+the parent Wannier90 directory, not inside this submodule:
+
+```bash
+git switch dlwf
+git pull origin dlwf
+git submodule update --init --recursive
+
+./scripts/install_pywannier90.sh \
+  --python "$(command -v python)" \
+  --jobs "${SLURM_CPUS_PER_TASK:-8}"
+```
+
+The script performs the following steps:
+
+1. Configures a Release build with the v4 C API and shared library enabled.
+2. Builds and installs the serial Wannier90 library and executables.
+3. Installs this Python adapter into the selected Python environment without
+   upgrading NumPy or PySCF.
+4. Generates an activation script containing `PYWANNIER90_LIB`, `PATH`, and
+   the required library and package search paths.
+5. Loads the installed library and runs the Python and native PySCF/DLWF tests.
+
+The default installation prefix is
+`$HOME/.local/wannier90-dlwf-4.0`. Activate it in each interactive or batch
+shell with:
+
+```bash
+source "$HOME/.local/wannier90-dlwf-4.0/activate-pywannier90.sh"
+```
+
+Useful customizations include:
+
+```bash
+# Select a different installation and build location.
+./scripts/install_pywannier90.sh \
+  --prefix "$HOME/software/wannier90-dlwf-4.0" \
+  --build-dir "$PWD/build/build-pywannier90" \
+  --python "$(command -v python)" \
+  --jobs 16
+
+# Show all options.
+./scripts/install_pywannier90.sh --help
+
+# Build/install W90 without modifying the active Python environment.
+./scripts/install_pywannier90.sh --skip-python --skip-tests
+```
+
+The Python adapter currently calls the serial library API, so the setup script
+uses `WANNIER90_MPI=OFF`. This does not disable threaded BLAS or OpenMP used by
+PySCF. Compiler selection may be supplied in the normal CMake manner, for
+example:
+
+```bash
+CC=gcc FC=gfortran ./scripts/install_pywannier90.sh
+```
+
+The installer itself is maintained at
+[`scripts/install_pywannier90.sh`](https://github.com/Yichen-Fan/wannier90/blob/dlwf/scripts/install_pywannier90.sh).
+
+### Manual installation
+
 Build Wannier90 v4 as a shared library with its C interface enabled:
 
 ```bash
