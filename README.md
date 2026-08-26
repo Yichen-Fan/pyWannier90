@@ -8,12 +8,94 @@ pyWannier90 uses the library-mode of wannier90 to perform the wannierization on 
 
 <img src="https://github.com/hungpham2017/pyWannier90/blob/master/doc/Si_sp3.png" width="500" align="middle">
 
+## PySCF 2.9 and Wannier90 v4 interface
+
+`src/pywannier90_v4.py` is a new adapter for the official Wannier90 v4 C
+library API. It keeps the legacy `src/pywannier90.py` implementation unchanged
+for reproducibility. The v4 adapter has been exercised with PySCF 2.9.0 using
+both ordinary maximally-localized Wannier functions and the v4 space-energy
+(DLWF) localizer.
+
+The current scope covers the core PySCF periodic workflow: restricted and
+unrestricted k-point MO extraction, band exclusion, neighbor and overlap
+construction, atomic projections or Bloch-phase initialization,
+disentanglement, Wannierization, centers, spreads, and Wannier-gauge
+Hamiltonians. Spinor wavefunctions are not yet supported. Wannier90 v4 itself
+does not currently allow `gamma_only` with space-energy localization.
+
+Build Wannier90 v4 as a shared library with its C interface enabled:
+
+```bash
+cmake -S /path/to/wannier90 -B /path/to/w90-build \
+  -DWANNIER90_WITH_C=ON \
+  -DWANNIER90_SHARED_LIBS=ON
+cmake --build /path/to/w90-build
+```
+
+The C interface requires a Fortran compiler with the Fortran 2018 C-descriptor
+support described in the Wannier90 v4 installation guide. Install this Python
+adapter and point it to the resulting library:
+
+```bash
+python -m pip install -e .
+export PYWANNIER90_LIB=/path/to/w90-build/libwannier90.so
+# macOS: /path/to/w90-build/libwannier90.dylib
+```
+
+Then pass a converged periodic PySCF mean-field object:
+
+```python
+from pywannier90_v4 import W90
+
+with W90(
+    kmf,
+    cell,
+    mp_grid=[2, 2, 2],
+    num_wann=4,
+    seedname="output/seed",
+    projections=["C:sp3"],
+    options={
+        "num_iter": 100,
+        "sp_en_mix": 0.5,
+        "sp_en_scale": 0.3781820678533007,
+        "sp_en_power": 2.0,
+    },
+) as w90:
+    w90.kernel()
+    print(w90.wann_centres, w90.wann_spreads)
+```
+
+`other_keywords` remains available for the common legacy syntax, but new code
+should use the typed `options`, `projections`, and `exclude_bands` arguments.
+See `examples/PySCF/h2_v4.py` for a complete PySCF 2.9 DLWF calculation.
+
+Run the Python-only tests with:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Enable the end-to-end PySCF/Wannier90-v4 integration test by setting:
+
+```bash
+PYWANNIER90_TEST_LIB=/path/to/libwannier90.so \
+  python -m unittest discover -s tests
+```
+
+## Attribution and license
+
+This remains a BSD-3-Clause adaptation of pyWannier90, originally written by
+Hung Q. Pham. The original copyright notice and license are retained in
+`LICENSE`, and the v4 source and example carry explicit attribution. Wannier90
+and PySCF are separate dependencies under their own licenses; see
+`THIRD_PARTY_NOTICES.md` for credits and details.
+
 ## News:
 - pyWannier90 is now available for wannier90 community, check it out [here](http://www.wannier.org/download/).
-- pyWannier90 only supports the wannier90 v3.0.0 or newer.
+- The legacy interface supports Wannier90 v3-era library mode; the new module targets the Wannier90 v4 C API.
 
 ## pyWannier90 can use the wave function obtained by:
-- PySCF 1.5 and 
+- PySCF 1.5 through the legacy interface, and PySCF 2.9 through `pywannier90_v4`
 - VASP via the [MCU package](https://hungpham2017.github.io/mcu/)
 
 ## Why pyWannier90?

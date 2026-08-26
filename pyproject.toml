@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pywannier90-v4-interface"
+version = "0.1.0"
+description = "PySCF interface to the Wannier90 v4 C library API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Hung Q. Pham (original pyWannier90 author)"},
+  {name = "pyWannier90 v4 interface contributors"},
+]
+dependencies = [
+  "numpy>=1.23",
+  "pyscf>=2.9",
+]
+
+[project.urls]
+"Original pyWannier90" = "https://github.com/hungpham2017/pyWannier90"
+"Wannier90" = "https://github.com/wannier-developers/wannier90"
+"PySCF" = "https://github.com/pyscf/pyscf"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["pywannier90_v4"]

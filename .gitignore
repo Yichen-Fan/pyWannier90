@@ -6,7 +6,7 @@ __pycache__
 pyDMET.egg-info
 dist/*
 data/*
-tests*
+test-output*
 *.so
 lib/build
 build
