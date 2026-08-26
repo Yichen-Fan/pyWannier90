@@ -6,6 +6,7 @@ shared library built with WANNIER90_WITH_C=ON.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import tempfile
 import unittest
@@ -13,7 +14,14 @@ from pathlib import Path
 
 import numpy as np
 
-from pywannier90_v4 import W90, _parse_legacy_keywords, projection_function
+from pywannier90_v4 import (
+    W90,
+    Wannier90V4Library,
+    _W90Data,
+    _default_kpoint_distribution,
+    _parse_legacy_keywords,
+    projection_function,
+)
 
 
 class ProjectionTests(unittest.TestCase):
@@ -59,6 +67,93 @@ class LegacyKeywordTests(unittest.TestCase):
         self.assertEqual(parsed["projections"], ["H:s"])
         self.assertFalse(parsed["use_bloch_phases"])
         self.assertAlmostEqual(parsed["sp_en_mix"], 0.5)
+
+
+class MPISupportTests(unittest.TestCase):
+    def test_default_distribution_is_contiguous_and_balanced(self):
+        np.testing.assert_array_equal(
+            _default_kpoint_distribution(7, 3),
+            np.array([0, 0, 0, 1, 1, 2, 2], dtype=np.int32),
+        )
+
+    def test_fortran_communicator_handle_is_passed_to_wannier90(self):
+        class FakeComm:
+            @staticmethod
+            def py2f():
+                return 37
+
+            @staticmethod
+            def Get_rank():
+                return 1
+
+            @staticmethod
+            def Get_size():
+                return 3
+
+        class FakeLibrary:
+            communicator = None
+
+            def w90_set_comm_f(self, data, handle):
+                del data
+                self.communicator = ctypes.cast(
+                    handle, ctypes.POINTER(ctypes.c_int)
+                ).contents.value
+
+        wrapper = object.__new__(Wannier90V4Library)
+        wrapper.is_mpi = True
+        wrapper.lib = FakeLibrary()
+        wrapper.data = _W90Data(ctypes.c_void_p(1))
+        wrapper.set_communicator(FakeComm())
+
+        self.assertEqual(wrapper.lib.communicator, 37)
+        self.assertEqual(wrapper.mpi_rank, 1)
+        self.assertEqual(wrapper.mpi_size, 3)
+
+    def test_global_m_matrix_is_packed_for_the_local_rank(self):
+        class FakeLibrary:
+            attached_m = None
+
+            def attach_matrices(self, eigenvalues, m_matrix, u_matrix, u_opt):
+                del eigenvalues, u_matrix, u_opt
+                self.attached_m = m_matrix
+
+            @staticmethod
+            def disentangle():
+                pass
+
+            @staticmethod
+            def project_overlap():
+                pass
+
+            @staticmethod
+            def wannierise():
+                return 0
+
+            @staticmethod
+            def get_centres_and_spreads(num_wann):
+                return np.zeros((3, num_wann)), np.zeros(num_wann)
+
+        adapter = object.__new__(W90)
+        adapter.library = FakeLibrary()
+        adapter.num_bands = 1
+        adapter.num_wann = 1
+        adapter.nntot = 1
+        adapter.num_kpts = 4
+        adapter.local_kpoint_indices = np.array([1, 3], dtype=np.int32)
+        adapter.mo_energy = np.zeros((4, 1))
+        adapter.band_included_list = [0]
+        global_m = np.arange(4, dtype=np.complex128).reshape(1, 1, 1, 4)
+
+        adapter.run(
+            m_matrix=global_m,
+            a_matrix=np.ones((1, 1, 4), dtype=np.complex128),
+            eigenvalues=np.zeros((1, 4)),
+        )
+
+        np.testing.assert_array_equal(
+            adapter.library.attached_m.reshape(-1), np.array([1.0, 3.0])
+        )
+        self.assertTrue(adapter.M_matrix_local.flags.f_contiguous)
 
 
 class PySCFObjectCompatibilityTests(unittest.TestCase):
@@ -164,7 +259,18 @@ class NativePySCF29Tests(unittest.TestCase):
                 },
             ) as w90:
                 w90.kernel()
-                self.assertEqual(w90.M_matrix.shape, (2, 2, 10, 2))
+                self.assertEqual(
+                    w90.M_matrix.shape,
+                    (2, 2, 10, w90.local_kpoint_indices.size),
+                )
+                if w90.is_mpi:
+                    distributed = w90.mpi_comm.allgather(
+                        w90.local_kpoint_indices.tolist()
+                    )
+                    self.assertEqual(
+                        sorted(index for indices in distributed for index in indices),
+                        list(range(w90.num_kpts)),
+                    )
                 self.assertEqual(w90.A_matrix.shape, (2, 2, 2))
                 self.assertEqual(w90.eigenvalues.shape, (2, 2))
                 self.assertEqual(w90.wann_centres.shape, (2, 3))

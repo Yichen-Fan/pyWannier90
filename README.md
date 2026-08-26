@@ -23,7 +23,7 @@ disentanglement, Wannierization, centers, spreads, and Wannier-gauge
 Hamiltonians. Spinor wavefunctions are not yet supported. Wannier90 v4 itself
 does not currently allow `gamma_only` with space-energy localization.
 
-### Recommended installation from the Wannier90 DLWF fork
+### Recommended serial installation for the PySCF interface
 
 When pyWannier90 is checked out as the submodule of the
 [`Yichen-Fan/wannier90`](https://github.com/Yichen-Fan/wannier90/tree/dlwf)
@@ -75,10 +75,10 @@ Useful customizations include:
 ./scripts/install_pywannier90.sh --skip-python --skip-tests
 ```
 
-The Python adapter currently calls the serial library API, so the setup script
-uses `WANNIER90_MPI=OFF`. This does not disable threaded BLAS or OpenMP used by
-PySCF. Compiler selection may be supplied in the normal CMake manner, for
-example:
+This installer deliberately builds the serial library with
+`WANNIER90_MPI=OFF`; use the MPI installer below when rank-level distribution
+is wanted. The setting does not disable threaded BLAS or OpenMP used by PySCF.
+Compiler selection may be supplied in the normal CMake manner, for example:
 
 ```bash
 CC=gcc FC=gfortran ./scripts/install_pywannier90.sh
@@ -87,6 +87,94 @@ CC=gcc FC=gfortran ./scripts/install_pywannier90.sh
 The installer itself is maintained at
 [`scripts/install_pywannier90.sh`](https://github.com/Yichen-Fan/wannier90/blob/dlwf/scripts/install_pywannier90.sh).
 
+### MPI-enabled PySCF/Wannier90 installation
+
+The parent repository provides a separate installer for MPI-enabled
+Wannier90 and the Python adapter. Load a mutually compatible compiler and MPI
+module stack first. The selected Python environment must contain `mpi4py`
+built against that same MPI implementation, as well as PySCF 2.9 or newer.
+Then run from the parent Wannier90 directory:
+
+```bash
+CC=gcc FC=mpifort ./scripts/install_pywannier90_mpi.sh \
+  --python "$(command -v python)" \
+  --jobs "${SLURM_CPUS_PER_TASK:-8}"
+
+source "$HOME/.local/wannier90-dlwf-4.0-mpi/activate-wannier90-mpi.sh"
+
+# Run the PySCF interface with the MPI library.
+mpiexec -n 4 python your_calculation.py
+
+# Or run the standalone Wannier90 executable.
+mpiexec -n 4 wannier90.x seedname
+```
+
+After obtaining a compute-node allocation, the native two-rank regression can
+be run from the parent repository with:
+
+```bash
+PYWANNIER90_TEST_LIB="$PYWANNIER90_LIB" \
+  mpiexec -n 2 python -m unittest discover -s pyWannier90/tests -v
+```
+
+On a cluster, replace `gcc`, `mpifort`, and `mpiexec` with the compiler and MPI
+wrappers supplied by the same module stack. Mixing compiler families can cause
+errors such as a missing `ISO_Fortran_binding.h` while compiling the v4 C API.
+Load the same MPI/compiler modules again in every shell or batch job before
+sourcing the activation file and running `mpiexec`.
+The installation and build locations can be customized independently of the
+serial installation:
+
+```bash
+./scripts/install_pywannier90_mpi.sh \
+  --prefix "$HOME/software/wannier90-dlwf-4.0-mpi" \
+  --build-dir "$PWD/build/build-pywannier90-mpi" \
+  --python "$(command -v python)" \
+  --jobs 16
+
+./scripts/install_pywannier90_mpi.sh --help
+
+# Install only the MPI executable/library, without Python checks.
+./scripts/install_pywannier90_mpi.sh --skip-python --skip-tests
+```
+
+The MPI build is kept separate because Wannier90 names its shared library
+`libwannier90_mpi`, rather than `libwannier90`. Its activation file exports
+both `WANNIER90_MPI_LIB` and `PYWANNIER90_LIB`, so the Python adapter discovers
+the installed MPI library automatically.
+
+When it loads `libwannier90_mpi`, `pywannier90_v4` initializes the library with
+`mpi4py.MPI.COMM_WORLD`, supplies Wannier90's `distk` map, and constructs only
+the rank-local part of the M matrix. The eigenvalues, projection matrix, and
+final U matrices remain replicated, as required by the Wannier90 v4 library
+API. A different communicator or distribution can be supplied explicitly:
+
+```python
+from mpi4py import MPI
+from pywannier90_v4 import W90
+
+w90 = W90(
+    kmf,
+    cell,
+    mp_grid=[4, 4, 4],
+    num_wann=8,
+    mpi_comm=MPI.COMM_WORLD,
+    kpoint_distribution=None,  # balanced contiguous distribution
+)
+w90.kernel()
+```
+
+Every MPI rank must enter the `W90` calls with an equivalent PySCF cell,
+k-point mean-field result, and options. PySCF's SCF calculation is not made
+MPI-parallel by this interface; for large jobs, load or reconstruct the same
+converged mean-field data on every rank before calling `W90`.
+
+The serial and MPI installations can coexist under their different default
+prefixes. Source only the activation file for the variant needed by the job.
+
+The MPI installer is maintained at
+[`scripts/install_pywannier90_mpi.sh`](https://github.com/Yichen-Fan/wannier90/blob/dlwf/scripts/install_pywannier90_mpi.sh).
+
 ### Manual installation
 
 Build Wannier90 v4 as a shared library with its C interface enabled:
@@ -94,7 +182,8 @@ Build Wannier90 v4 as a shared library with its C interface enabled:
 ```bash
 cmake -S /path/to/wannier90 -B /path/to/w90-build \
   -DWANNIER90_WITH_C=ON \
-  -DWANNIER90_SHARED_LIBS=ON
+  -DWANNIER90_SHARED_LIBS=ON \
+  -DWANNIER90_MPI=OFF
 cmake --build /path/to/w90-build
 ```
 

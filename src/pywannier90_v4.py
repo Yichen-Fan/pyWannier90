@@ -37,12 +37,19 @@ def _array_pointer(array: np.ndarray) -> ctypes.c_void_p:
 
 
 def _candidate_library_paths(explicit_path: str | os.PathLike[str] | None) -> list[str]:
-    names = (
+    serial_names = (
         "libwannier90.4.dylib",
         "libwannier90.dylib",
         "libwannier90.so.4",
         "libwannier90.so",
     )
+    mpi_names = (
+        "libwannier90_mpi.4.dylib",
+        "libwannier90_mpi.dylib",
+        "libwannier90_mpi.so.4",
+        "libwannier90_mpi.so",
+    )
+    names = serial_names + mpi_names
 
     if explicit_path is not None:
         path = Path(explicit_path).expanduser()
@@ -56,8 +63,10 @@ def _candidate_library_paths(explicit_path: str | os.PathLike[str] | None) -> li
         return [str(path)]
 
     candidates: list[str] = []
-    configured = os.environ.get("PYWANNIER90_LIB")
-    if configured:
+    for variable in ("PYWANNIER90_LIB", "WANNIER90_MPI_LIB"):
+        configured = os.environ.get(variable)
+        if not configured:
+            continue
         configured_path = Path(configured).expanduser()
         if configured_path.is_dir():
             candidates.extend(str(configured_path / name) for name in names)
@@ -69,9 +78,10 @@ def _candidate_library_paths(explicit_path: str | os.PathLike[str] | None) -> li
             if directory:
                 candidates.extend(str(Path(directory) / name) for name in names)
 
-    found = ctypes.util.find_library("wannier90")
-    if found:
-        candidates.append(found)
+    for library_name in ("wannier90", "wannier90_mpi"):
+        found = ctypes.util.find_library(library_name)
+        if found:
+            candidates.append(found)
     candidates.extend(names)
 
     unique: list[str] = []
@@ -84,15 +94,33 @@ def _candidate_library_paths(explicit_path: str | os.PathLike[str] | None) -> li
 class Wannier90V4Library:
     """Thin owner-aware wrapper around Wannier90's version-4 C API."""
 
-    def __init__(self, library_path: str | os.PathLike[str] | None = None):
+    def __init__(
+        self,
+        library_path: str | os.PathLike[str] | None = None,
+        mpi_comm: Any | None = None,
+    ):
         self.path, self.lib = self._load(library_path)
         self._configure_signatures()
+        self.is_mpi = hasattr(self.lib, "w90_set_comm_f")
         self.data = _W90Data()
         self.lib.w90_create(ctypes.byref(self.data))
         if not self.data.cptr:
             raise Wannier90Error("w90_create did not return a valid Wannier90 object")
         self._closed = False
         self._matrix_owners: tuple[np.ndarray, ...] = ()
+        self.mpi_comm: Any | None = None
+        self.mpi_rank = 0
+        self.mpi_size = 1
+        try:
+            if self.is_mpi:
+                self.set_communicator(mpi_comm)
+            elif mpi_comm is not None:
+                raise ValueError(
+                    "mpi_comm was supplied, but the selected Wannier90 library is serial"
+                )
+        except Exception:
+            self.close()
+            raise
 
     @staticmethod
     def _load(
@@ -113,7 +141,8 @@ class Wannier90V4Library:
         detail = "\n  ".join(errors) if errors else "no candidate paths were found"
         raise OSError(
             "Unable to load a Wannier90 v4 shared library built with "
-            "WANNIER90_WITH_C=ON. Set PYWANNIER90_LIB or pass library_path.\n  "
+            "WANNIER90_WITH_C=ON. Set PYWANNIER90_LIB or "
+            "WANNIER90_MPI_LIB, or pass library_path.\n  "
             + detail
         )
 
@@ -185,6 +214,50 @@ class Wannier90V4Library:
             function = getattr(self.lib, name)
             function.argtypes = argtypes
             function.restype = None
+        if hasattr(self.lib, "w90_set_comm_f"):
+            self.lib.w90_set_comm_f.argtypes = [data, int_p]
+            self.lib.w90_set_comm_f.restype = None
+
+    def set_communicator(self, mpi_comm: Any | None = None) -> None:
+        """Attach an mpi4py-compatible communicator to an MPI Wannier90 build."""
+
+        if not self.is_mpi:
+            raise Wannier90Error("The loaded Wannier90 library was built without MPI")
+        if mpi_comm is None:
+            try:
+                from mpi4py import MPI
+            except ImportError as exc:
+                raise ImportError(
+                    "An MPI-enabled Wannier90 library requires mpi4py built against "
+                    "the same MPI implementation. Install pywannier90-v4-interface[mpi] "
+                    "after loading the compiler/MPI module stack."
+                ) from exc
+            if MPI.Is_finalized():
+                raise RuntimeError("MPI has already been finalized")
+            if not MPI.Is_initialized():
+                MPI.Init()
+            mpi_comm = MPI.COMM_WORLD
+
+        required = ("py2f", "Get_rank", "Get_size")
+        missing = [name for name in required if not hasattr(mpi_comm, name)]
+        if missing:
+            raise TypeError(
+                "mpi_comm must be an mpi4py-compatible communicator; missing "
+                + ", ".join(missing)
+            )
+        try:
+            rank = int(mpi_comm.Get_rank())
+            size = int(mpi_comm.Get_size())
+            fortran_handle = ctypes.c_int(int(mpi_comm.py2f()))
+        except Exception as exc:
+            raise ValueError("mpi_comm is not a valid active MPI communicator") from exc
+        if size < 1 or rank < 0 or rank >= size:
+            raise ValueError(f"Invalid MPI communicator rank/size: rank={rank}, size={size}")
+
+        self.lib.w90_set_comm_f(self.data, ctypes.byref(fortran_handle))
+        self.mpi_comm = mpi_comm
+        self.mpi_rank = rank
+        self.mpi_size = size
 
     def set_option(self, key: str, value: Any) -> None:
         """Set a Wannier90 option, dispatching to its type-specific C function."""
@@ -602,6 +675,18 @@ def _parse_legacy_keywords(text: str | None) -> dict[str, Any]:
     return parsed
 
 
+def _default_kpoint_distribution(num_kpts: int, mpi_size: int) -> np.ndarray:
+    """Return Wannier90's contiguous, balanced k-point-to-rank mapping."""
+
+    if num_kpts < 1:
+        raise ValueError("num_kpts must be positive")
+    if mpi_size < 1:
+        raise ValueError("mpi_size must be positive")
+    counts = np.full(mpi_size, num_kpts // mpi_size, dtype=np.int32)
+    counts[: num_kpts % mpi_size] += 1
+    return np.repeat(np.arange(mpi_size, dtype=np.int32), counts)
+
+
 class W90:
     """Wannier90 v4 workflow for periodic PySCF mean-field objects.
 
@@ -620,6 +705,7 @@ class W90:
         "symbols",
         "atoms_cart",
         "atoms_frac",
+        "distk",
     }
 
     def __init__(
@@ -639,6 +725,8 @@ class W90:
         exclude_bands: Sequence[int] | None = None,
         use_bloch_phases: bool = False,
         options: Mapping[str, Any] | None = None,
+        mpi_comm: Any | None = None,
+        kpoint_distribution: Sequence[int] | None = None,
     ):
         if spinors:
             raise NotImplementedError("Spinor PySCF wavefunctions are not yet supported")
@@ -652,6 +740,12 @@ class W90:
         self.spinors = bool(spinors)
         self.spin = spin.lower()
         self.library_path = library_path
+        self.mpi_comm = mpi_comm
+        self.requested_kpoint_distribution = (
+            None
+            if kpoint_distribution is None
+            else np.asarray(kpoint_distribution, dtype=np.int32)
+        )
         self.seedname = str(Path(seedname).expanduser().resolve())
 
         legacy_options = _parse_legacy_keywords(other_keywords)
@@ -704,6 +798,11 @@ class W90:
         )
 
         self.library: Wannier90V4Library | None = None
+        self.is_mpi = False
+        self.mpi_rank = 0
+        self.mpi_size = 1
+        self.dist_kpoints = np.zeros(self.num_kpts, dtype=np.int32)
+        self.local_kpoint_indices = np.arange(self.num_kpts, dtype=np.int32)
         self.nntot: int | None = None
         self.nnkp: np.ndarray | None = None
         self.gkpb: np.ndarray | None = None
@@ -713,6 +812,7 @@ class W90:
         self.projection_data: dict[str, np.ndarray] | None = None
 
         self.M_matrix: np.ndarray | None = None
+        self.M_matrix_local: np.ndarray | None = None
         self.A_matrix: np.ndarray | None = None
         self.eigenvalues: np.ndarray | None = None
         self.u_matrix: np.ndarray | None = None
@@ -782,10 +882,37 @@ class W90:
     def setup(self) -> None:
         if self.library is not None:
             raise RuntimeError("This W90 instance has already been set up")
-        library = Wannier90V4Library(self.library_path)
+        library = Wannier90V4Library(self.library_path, mpi_comm=self.mpi_comm)
         try:
+            self.is_mpi = library.is_mpi
+            self.mpi_comm = library.mpi_comm
+            self.mpi_rank = library.mpi_rank
+            self.mpi_size = library.mpi_size
+            if self.requested_kpoint_distribution is None:
+                distribution = _default_kpoint_distribution(
+                    self.num_kpts, self.mpi_size
+                )
+            else:
+                distribution = self.requested_kpoint_distribution
+                if distribution.shape != (self.num_kpts,):
+                    raise ValueError(
+                        "kpoint_distribution must contain one rank for each "
+                        f"k-point; expected {self.num_kpts}, got {distribution.size}"
+                    )
+                if np.any(distribution < 0) or np.any(distribution >= self.mpi_size):
+                    raise ValueError(
+                        "kpoint_distribution contains a rank outside the active "
+                        f"communicator of size {self.mpi_size}"
+                    )
+                distribution = np.array(distribution, dtype=np.int32, copy=True)
+            self.dist_kpoints = distribution
+            self.local_kpoint_indices = np.flatnonzero(
+                distribution == self.mpi_rank
+            ).astype(np.int32)
+
             library.set_option("kpoints", self.kpt_latt)
             library.set_option("mp_grid", self.mp_grid)
+            library.set_option("distk", self.dist_kpoints)
             library.set_option("total_bands", self.num_bands_total)
             library.set_option("num_wann", self.num_wann)
             library.set_option("unit_cell_cart", self.real_lattice)
@@ -845,11 +972,17 @@ class W90:
         from pyscf.pbc.df import ft_ao
 
         result = np.empty(
-            (self.num_bands, self.num_bands, self.nntot, self.num_kpts),
+            (
+                self.num_bands,
+                self.num_bands,
+                self.nntot,
+                self.local_kpoint_indices.size,
+            ),
             dtype=np.complex128,
             order="F",
         )
-        for k_index in range(self.num_kpts):
+        for local_index, k_index_value in enumerate(self.local_kpoint_indices):
+            k_index = int(k_index_value)
             k1 = self.cell.get_abs_kpts(self.kpt_latt[k_index])
             coeff1 = self.mo_coeff[k_index][:, self.band_included_list]
             for neighbour in range(self.nntot):
@@ -863,7 +996,9 @@ class W90:
                     q=np.zeros(3),
                 )[0]
                 coeff2 = self.mo_coeff[k2_index][:, self.band_included_list]
-                result[:, :, neighbour, k_index] = coeff1.conj().T @ overlap_ao @ coeff2
+                result[:, :, neighbour, local_index] = (
+                    coeff1.conj().T @ overlap_ao @ coeff2
+                )
         return result
 
     def get_A_mat(self) -> np.ndarray:
@@ -929,11 +1064,23 @@ class W90:
         a_matrix = self.get_A_mat() if a_matrix is None else a_matrix
         eigenvalues = self.get_epsilon_mat() if eigenvalues is None else eigenvalues
 
-        expected_m = (self.num_bands, self.num_bands, self.nntot, self.num_kpts)
+        expected_m = (
+            self.num_bands,
+            self.num_bands,
+            self.nntot,
+            self.local_kpoint_indices.size,
+        )
+        global_m = (self.num_bands, self.num_bands, self.nntot, self.num_kpts)
         expected_a = (self.num_bands, self.num_wann, self.num_kpts)
         expected_e = (self.num_bands, self.num_kpts)
-        if np.shape(m_matrix) != expected_m:
-            raise ValueError(f"M matrix shape must be {expected_m}, got {np.shape(m_matrix)}")
+        supplied_m_shape = np.shape(m_matrix)
+        if supplied_m_shape == global_m and global_m != expected_m:
+            m_matrix = np.take(m_matrix, self.local_kpoint_indices, axis=3)
+        elif supplied_m_shape != expected_m:
+            allowed = f"{expected_m} (rank-local)"
+            if global_m != expected_m:
+                allowed += f" or {global_m} (global)"
+            raise ValueError(f"M matrix shape must be {allowed}, got {supplied_m_shape}")
         if np.shape(a_matrix) != expected_a:
             raise ValueError(f"A matrix shape must be {expected_a}, got {np.shape(a_matrix)}")
         if np.shape(eigenvalues) != expected_e:
@@ -942,6 +1089,7 @@ class W90:
             )
 
         self.M_matrix = np.asfortranarray(m_matrix, dtype=np.complex128)
+        self.M_matrix_local = self.M_matrix
         self.A_matrix = np.asfortranarray(a_matrix, dtype=np.complex128)
         self.eigenvalues = np.asfortranarray(eigenvalues, dtype=np.float64)
         self.u_matrix = np.zeros(

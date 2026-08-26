@@ -18,6 +18,9 @@ dependencies = [
   "pyscf>=2.9",
 ]
 
+[project.optional-dependencies]
+mpi = ["mpi4py>=3.1"]
+
 [project.urls]
 "Original pyWannier90" = "https://github.com/hungpham2017/pyWannier90"
 "Wannier90" = "https://github.com/wannier-developers/wannier90"
