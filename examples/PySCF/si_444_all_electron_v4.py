@@ -59,6 +59,9 @@ NUM_CORE_BANDS = 10
 NUM_VALENCE_BANDS = 4
 FIRST_VALENCE_BAND = NUM_CORE_BANDS + 1
 LAST_VALENCE_BAND = NUM_CORE_BANDS + NUM_VALENCE_BANDS
+PLOT_WANNIER_FUNCTIONS = True
+WF_PLOT_SUPERCELL = [3, 3, 3]
+WF_PLOT_GRID = [20, 20, 20]
 
 # Quantum ESPRESSO ibrav=2 primitive vectors, expressed in Angstrom.
 lattice = 0.5 * LATTICE_CONSTANT_ANG * np.array(
@@ -175,3 +178,15 @@ with W90(
             "Per-orbital space-energy data:",
             output / "si_valence_all_electron_dlwf.info",
         )
+        if PLOT_WANNIER_FUNCTIONS:
+            plot_files = w90.plot_wf(
+                outfile=output / "si_valence_all_electron_wf",
+                wf_list=range(NUM_VALENCE_BANDS),
+                supercell=WF_PLOT_SUPERCELL,
+                grid=WF_PLOT_GRID,
+            )
+            print("Wannier-function XSF files:", *plot_files, sep="\n  ")
+            print(
+                "Wannier-function max imaginary/real ratios:",
+                w90.wannier_plot_imaginary_ratios,
+            )

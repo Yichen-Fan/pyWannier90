@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -211,6 +214,76 @@ class PySCFObjectCompatibilityTests(unittest.TestCase):
                 use_bloch_phases=True,
                 options={"sp_en_mix": 0.5},
             )
+
+
+class WannierPlotTests(unittest.TestCase):
+    class _Cell:
+        @staticmethod
+        def lattice_vectors():
+            return np.eye(3)
+
+    @staticmethod
+    def _adapter():
+        adapter = object.__new__(W90)
+        adapter.cell = WannierPlotTests._Cell()
+        adapter.real_lattice = np.eye(3)
+        adapter.atom_symbols = ["H"]
+        adapter.atoms_cart = np.zeros((1, 3))
+        adapter.num_wann = 1
+        adapter.num_kpts = 1
+        adapter.kpts = np.zeros((1, 3))
+        adapter.band_included_list = [0]
+        adapter.mo_coeff = np.array([[[2.0 + 0.0j]]])
+        adapter.u_matrix_opt = np.array([[[1.0 + 0.0j]]])
+        adapter.u_matrix = np.array([[[1.0 + 0.0j]]])
+        adapter.is_mpi = False
+        adapter.mpi_rank = 0
+        return adapter
+
+    @staticmethod
+    def _fake_pyscf_modules():
+        numint = types.ModuleType("pyscf.pbc.dft.numint")
+        numint.eval_ao = lambda cell, coordinates, kpt: np.ones(
+            (len(coordinates), 1), dtype=np.complex128
+        )
+        dft = types.ModuleType("pyscf.pbc.dft")
+        dft.__path__ = []
+        dft.numint = numint
+        pbc = types.ModuleType("pyscf.pbc")
+        pbc.__path__ = []
+        pbc.dft = dft
+        pyscf = types.ModuleType("pyscf")
+        pyscf.__path__ = []
+        pyscf.pbc = pbc
+        return {
+            "pyscf": pyscf,
+            "pyscf.pbc": pbc,
+            "pyscf.pbc.dft": dft,
+            "pyscf.pbc.dft.numint": numint,
+        }
+
+    def test_get_wannier_applies_final_transform_on_xsf_ordered_grid(self):
+        adapter = self._adapter()
+        with mock.patch.dict(sys.modules, self._fake_pyscf_modules()):
+            values = adapter.get_wannier(grid=(2, 2, 2), chunk_size=3)
+        self.assertEqual(values.shape, (8, 1))
+        np.testing.assert_allclose(values, 2.0)
+        np.testing.assert_allclose(adapter.wannier_plot_imaginary_ratios, 0.0)
+
+    def test_plot_wf_writes_xsf_on_root_only(self):
+        adapter = self._adapter()
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "WF"
+            with mock.patch.dict(sys.modules, self._fake_pyscf_modules()):
+                written = adapter.plot_wf(prefix, grid=(2, 2, 2))
+            self.assertEqual(written, [Path(f"{prefix}-0.xsf")])
+            contents = written[0].read_text()
+            self.assertIn("BEGIN_DATAGRID_3D_UNKNOWN", contents)
+            self.assertIn("2 2 2", contents)
+
+            adapter.is_mpi = True
+            adapter.mpi_rank = 1
+            self.assertEqual(adapter.plot_wf(prefix, grid=(2, 2, 2)), [])
 
 
 @unittest.skipUnless(

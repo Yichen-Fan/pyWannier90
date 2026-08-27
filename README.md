@@ -218,7 +218,18 @@ with W90(
 ) as w90:
     w90.kernel()
     print(w90.wann_centres, w90.wann_spreads)
+    w90.plot_wf(
+        outfile="output/MLWF",
+        supercell=[3, 3, 3],
+        grid=[20, 20, 20],
+    )
 ```
+
+`plot_wf` reconstructs the final Wannier functions from the PySCF Bloch AOs
+and the Wannier90 `U_opt U` transformation, then writes signed real amplitudes
+as `output/MLWF-0.xsf`, `output/MLWF-1.xsf`, and so on. Wannier-function
+indices are zero-based. In an MPI run only rank 0 performs plotting and file
+output.
 
 `other_keywords` remains available for the common legacy syntax, but new code
 should use the typed `options`, `projections`, and `exclude_bands` arguments.

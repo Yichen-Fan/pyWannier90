@@ -57,6 +57,9 @@ def run_scf_once_and_share(kmf):
 LATTICE_CONSTANT_ANG = 5.43
 MP_GRID = [4, 4, 4]
 NUM_OCCUPIED = 4
+PLOT_WANNIER_FUNCTIONS = True
+WF_PLOT_SUPERCELL = [3, 3, 3]
+WF_PLOT_GRID = [20, 20, 20]
 
 # Quantum ESPRESSO ibrav=2 primitive vectors, expressed in Angstrom.
 lattice = 0.5 * LATTICE_CONSTANT_ANG * np.array(
@@ -150,3 +153,15 @@ with W90(
         print("Centers (Angstrom):\n", w90.wann_centres)
         print("Spatial spreads (Angstrom^2):\n", w90.wann_spreads)
         print("Per-orbital space-energy data:", output / "si_valence_dlwf.info")
+        if PLOT_WANNIER_FUNCTIONS:
+            plot_files = w90.plot_wf(
+                outfile=output / "si_valence_wf",
+                wf_list=range(NUM_OCCUPIED),
+                supercell=WF_PLOT_SUPERCELL,
+                grid=WF_PLOT_GRID,
+            )
+            print("Wannier-function XSF files:", *plot_files, sep="\n  ")
+            print(
+                "Wannier-function max imaginary/real ratios:",
+                w90.wannier_plot_imaginary_ratios,
+            )

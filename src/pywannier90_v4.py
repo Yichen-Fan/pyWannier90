@@ -1134,6 +1134,195 @@ class W90:
             result[k_index] = u.conj().T @ subspace_hamiltonian @ u
         return result
 
+    @staticmethod
+    def _plot_grid(
+        cell: Any,
+        real_lattice: np.ndarray,
+        supercell: Sequence[int],
+        grid: Sequence[int],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int]]:
+        """Build a centred periodic plotting grid and its XSF geometry."""
+
+        grid_array = np.asarray(grid, dtype=np.int32)
+        supercell_array = np.asarray(supercell, dtype=np.int32)
+        if grid_array.shape != (3,) or np.any(grid_array <= 0):
+            raise ValueError("grid must contain three positive integers")
+        if supercell_array.shape != (3,) or np.any(supercell_array <= 0):
+            raise ValueError("supercell must contain three positive integers")
+
+        ranges = [
+            np.arange(
+                -grid_array[axis] * (supercell_array[axis] // 2),
+                grid_array[axis] * ((supercell_array[axis] + 1) // 2),
+                dtype=np.int32,
+            )
+            for axis in range(3)
+        ]
+        mesh = np.meshgrid(*ranges, indexing="ij")
+        fractional = np.column_stack(
+            [
+                mesh[axis].ravel(order="F") / float(grid_array[axis])
+                for axis in range(3)
+            ]
+        )
+        coordinates_bohr = fractional @ np.asarray(cell.lattice_vectors())
+        origin_angstrom = fractional[0] @ real_lattice
+        data_vectors_angstrom = real_lattice * (
+            (grid_array * supercell_array - 1) / grid_array
+        )[:, None]
+        shape = tuple(int(value) for value in grid_array * supercell_array)
+        return coordinates_bohr, origin_angstrom, data_vectors_angstrom, shape
+
+    def get_wannier(
+        self,
+        wf_list: Sequence[int] | None = None,
+        supercell: Sequence[int] = (1, 1, 1),
+        grid: Sequence[int] = (50, 50, 50),
+        *,
+        chunk_size: int = 20000,
+    ) -> np.ndarray:
+        """Evaluate selected Wannier functions on a periodic real-space grid.
+
+        ``wf_list`` uses zero-based Wannier-function indices.  The returned
+        array has shape ``(prod(grid * supercell), len(wf_list))`` and follows
+        XSF ordering, with the first grid direction varying fastest.
+        """
+
+        if self.u_matrix is None or self.u_matrix_opt is None:
+            raise RuntimeError("Run wannierization before evaluating Wannier functions")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+
+        if wf_list is None:
+            wf_indices = np.arange(self.num_wann, dtype=np.int32)
+        else:
+            wf_indices = np.asarray(list(wf_list), dtype=np.int32)
+        if wf_indices.ndim != 1:
+            raise ValueError("wf_list must be a one-dimensional sequence")
+        if np.any(wf_indices < 0) or np.any(wf_indices >= self.num_wann):
+            raise IndexError(
+                f"wf_list entries must lie between 0 and {self.num_wann - 1}"
+            )
+
+        coordinates, _, _, _ = self._plot_grid(
+            self.cell, self.real_lattice, supercell, grid
+        )
+        values = np.zeros(
+            (coordinates.shape[0], wf_indices.size), dtype=np.complex128
+        )
+
+        from pyscf.pbc.dft import numint
+
+        for k_index, kpoint in enumerate(self.kpts):
+            bloch_coefficients = self.mo_coeff[k_index][
+                :, self.band_included_list
+            ]
+            wannier_coefficients = (
+                bloch_coefficients
+                @ self.u_matrix_opt[:, :, k_index]
+                @ self.u_matrix[:, :, k_index]
+            )[:, wf_indices]
+            for start in range(0, coordinates.shape[0], chunk_size):
+                stop = min(start + chunk_size, coordinates.shape[0])
+                ao_values = numint.eval_ao(
+                    self.cell, coordinates[start:stop], kpt=kpoint
+                )
+                values[start:stop] += ao_values @ wannier_coefficients
+
+        values /= self.num_kpts
+
+        # Fix each arbitrary global phase so that its largest-amplitude grid
+        # value is positive and real, following the pw2wannier90 convention.
+        imaginary_ratios = np.zeros(wf_indices.size)
+        for column in range(wf_indices.size):
+            maximum = int(np.argmax(np.abs(values[:, column])))
+            reference = values[maximum, column]
+            if abs(reference) > 0.0:
+                values[:, column] /= reference / abs(reference)
+            real_maximum = np.max(np.abs(values[:, column].real))
+            if real_maximum > 0.0:
+                imaginary_ratios[column] = (
+                    np.max(np.abs(values[:, column].imag)) / real_maximum
+                )
+        self.wannier_plot_imaginary_ratios = imaginary_ratios
+        return values
+
+    def plot_wf(
+        self,
+        outfile: str | os.PathLike[str] = "MLWF",
+        wf_list: Sequence[int] | None = None,
+        supercell: Sequence[int] = (1, 1, 1),
+        grid: Sequence[int] = (50, 50, 50),
+        *,
+        chunk_size: int = 20000,
+    ) -> list[Path]:
+        """Write selected real-space Wannier functions as XSF datagrids.
+
+        Files are named ``<outfile>-<zero-based-index>.xsf``.  In MPI mode,
+        only rank 0 performs the real-space reconstruction and file writes.
+        """
+
+        if self.is_mpi and self.mpi_rank != 0:
+            return []
+        if wf_list is None:
+            wf_indices = np.arange(self.num_wann, dtype=np.int32)
+        else:
+            wf_indices = np.asarray(list(wf_list), dtype=np.int32)
+
+        coordinates, origin, data_vectors, shape = self._plot_grid(
+            self.cell, self.real_lattice, supercell, grid
+        )
+        del coordinates
+        values = self.get_wannier(
+            wf_indices,
+            supercell=supercell,
+            grid=grid,
+            chunk_size=chunk_size,
+        )
+        nx, ny, nz = shape
+        output_prefix = Path(outfile)
+        output_prefix.parent.mkdir(parents=True, exist_ok=True)
+        written: list[Path] = []
+
+        for column, wf_index_value in enumerate(wf_indices):
+            wf_index = int(wf_index_value)
+            path = Path(f"{output_prefix}-{wf_index}.xsf")
+            field = values[:, column].real.reshape(shape, order="F")
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write("Generated by pywannier90_v4\n\n")
+                handle.write("CRYSTAL\nPRIMVEC\n")
+                for vector in self.real_lattice:
+                    handle.write("%16.10f %16.10f %16.10f\n" % tuple(vector))
+                handle.write("CONVVEC\n")
+                for vector in self.real_lattice:
+                    handle.write("%16.10f %16.10f %16.10f\n" % tuple(vector))
+                handle.write("PRIMCOORD\n")
+                handle.write(f"{len(self.atom_symbols):d} 1\n")
+                for symbol, position in zip(self.atom_symbols, self.atoms_cart):
+                    handle.write(
+                        f"{symbol:2s} {position[0]:16.10f} "
+                        f"{position[1]:16.10f} {position[2]:16.10f}\n"
+                    )
+                handle.write("\nBEGIN_BLOCK_DATAGRID_3D\n")
+                handle.write(f"wannier_function_{wf_index}\n")
+                handle.write("BEGIN_DATAGRID_3D_UNKNOWN\n")
+                handle.write(f"{nx:d} {ny:d} {nz:d}\n")
+                handle.write("%16.10f %16.10f %16.10f\n" % tuple(origin))
+                for vector in data_vectors:
+                    handle.write("%16.10f %16.10f %16.10f\n" % tuple(vector))
+                for z_index in range(nz):
+                    for y_index in range(ny):
+                        handle.write(
+                            " ".join(
+                                f"{value:16.8e}"
+                                for value in field[:, y_index, z_index]
+                            )
+                            + "\n"
+                        )
+                handle.write("END_DATAGRID_3D\nEND_BLOCK_DATAGRID_3D\n")
+            written.append(path)
+        return written
+
     def close(self) -> None:
         if self.library is not None:
             self.library.close()
