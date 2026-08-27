@@ -1,0 +1,177 @@
+"""All-electron diamond-Si 4x4x4 input for the Wannier90-v4 localizer.
+
+The cell, k mesh, valence-band manifold, trial functions, and localization
+parameters match ``si_444_v4.py``.  This variant replaces the GTH
+pseudopotential calculation with an all-electron cc-pVDZ/PBE calculation.
+"""
+
+from pathlib import Path
+
+import numpy as np
+from pyscf.pbc import dft, gto
+
+from pywannier90_v4 import W90
+
+
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
+
+MPI_COMM = None if MPI is None else MPI.COMM_WORLD
+MPI_RANK = 0 if MPI_COMM is None else MPI_COMM.Get_rank()
+MPI_SIZE = 1 if MPI_COMM is None else MPI_COMM.Get_size()
+
+
+def run_scf_once_and_share(kmf):
+    """Run PySCF on rank 0 and replicate the orbitals needed by W90."""
+
+    scf_data = None
+    if MPI_RANK == 0:
+        try:
+            kmf.kernel()
+        except Exception as exc:  # propagate a root failure to every rank
+            scf_data = {"error": f"{type(exc).__name__}: {exc}"}
+        else:
+            scf_data = {
+                "error": None,
+                "converged": bool(kmf.converged),
+                "e_tot": float(kmf.e_tot),
+                "mo_energy": np.asarray(kmf.mo_energy),
+                "mo_coeff": np.asarray(kmf.mo_coeff),
+                "mo_occ": np.asarray(kmf.mo_occ),
+            }
+    if MPI_COMM is not None:
+        scf_data = MPI_COMM.bcast(scf_data, root=0)
+    if scf_data["error"] is not None:
+        raise RuntimeError(f"Rank-0 PySCF calculation failed: {scf_data['error']}")
+
+    kmf.converged = scf_data["converged"]
+    kmf.e_tot = scf_data["e_tot"]
+    kmf.mo_energy = scf_data["mo_energy"]
+    kmf.mo_coeff = scf_data["mo_coeff"]
+    kmf.mo_occ = scf_data["mo_occ"]
+
+
+LATTICE_CONSTANT_ANG = 5.43
+MP_GRID = [4, 4, 4]
+NUM_CORE_BANDS = 10
+NUM_VALENCE_BANDS = 4
+FIRST_VALENCE_BAND = NUM_CORE_BANDS + 1
+LAST_VALENCE_BAND = NUM_CORE_BANDS + NUM_VALENCE_BANDS
+
+# Quantum ESPRESSO ibrav=2 primitive vectors, expressed in Angstrom.
+lattice = 0.5 * LATTICE_CONSTANT_ANG * np.array(
+    [
+        [-1.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0],
+        [-1.0, 1.0, 0.0],
+    ]
+)
+
+# The second position is crystal (1/4, 1/4, 1/4) in the lattice above.
+second_si = np.array([0.25, 0.25, 0.25]) @ lattice
+
+cell = gto.Cell(
+    atom=[("Si", (0.0, 0.0, 0.0)), ("Si", second_si)],
+    a=lattice,
+    unit="A",
+    basis="cc-pvdz",
+    # No pseudo or ECP is set: all 28 electrons in the primitive cell are
+    # treated explicitly.  Remove very diffuse primitives if they cause
+    # near-linear dependence in the periodic AO overlap matrix.
+    exp_to_discard=0.1,
+    # All-electron PBE needs a substantially finer density/XC grid than the
+    # pseudopotential example.  Converge this mesh before quantitative use.
+    mesh=[61, 61, 61],
+    precision=1.0e-9,
+    verbose=4 if MPI_RANK == 0 else 0,
+).build()
+
+if cell.nelectron != 28:
+    raise RuntimeError(f"Expected 28 all-electron electrons, got {cell.nelectron}")
+
+kpts = cell.make_kpts(MP_GRID)
+kmf = dft.KRKS(cell, kpts).density_fit()
+kmf.xc = "PBE"
+kmf.conv_tol = 1.0e-10
+kmf.max_cycle = 100
+
+output = Path("si-wannier90-v4-all-electron")
+if MPI_RANK == 0:
+    output.mkdir(exist_ok=True)
+if MPI_COMM is not None:
+    MPI_COMM.Barrier()
+kmf.chkfile = (
+    str(output / "si_444_all_electron_scf.chk") if MPI_RANK == 0 else None
+)
+run_scf_once_and_share(kmf)
+if not kmf.converged:
+    raise RuntimeError("The all-electron PySCF KRKS calculation did not converge")
+
+num_bands = min(np.asarray(energy).size for energy in kmf.mo_energy)
+if num_bands < LAST_VALENCE_BAND:
+    raise RuntimeError(
+        f"Need at least {LAST_VALENCE_BAND} bands, but PySCF returned {num_bands}"
+    )
+
+# Wannier90 indices are 1-based.  Retain only bands 11--14: bands 1--10 are
+# the two Si [Ne] cores and bands 15 onward are virtual bands.
+exclude_bands = list(range(1, FIRST_VALENCE_BAND)) + list(
+    range(LAST_VALENCE_BAND + 1, num_bands + 1)
+)
+
+bond_projections = [
+    "f= 0.125, 0.125, 0.125:s",
+    "f=-0.375, 0.125, 0.125:s",
+    "f= 0.125,-0.375, 0.125:s",
+    "f= 0.125, 0.125,-0.375:s",
+]
+
+with W90(
+    kmf,
+    cell,
+    MP_GRID,
+    num_wann=NUM_VALENCE_BANDS,
+    seedname=output / "si_valence_all_electron_dlwf",
+    projections=bond_projections,
+    exclude_bands=exclude_bands,
+    mpi_comm=MPI_COMM if MPI_SIZE > 1 else None,
+    options={
+        "iprint": 2,
+        "num_iter": 200,
+        "conv_window": 5,
+        "conv_tol": 1.0e-8,
+        "sp_en_mix": 0.5,
+        "sp_en_scale": 0.3781820678533007,
+        "sp_en_power": 2.0,
+        "sp_en_trust_radius": 0.2,
+        "write_info": True,
+        # num_occ refers to the bands left after exclude_bands is applied.
+        "num_occ": NUM_VALENCE_BANDS,
+    },
+) as w90:
+    w90.setup()
+    local_counts = (
+        [w90.local_kpoint_indices.size]
+        if MPI_COMM is None
+        else MPI_COMM.gather(w90.local_kpoint_indices.size, root=0)
+    )
+    if MPI_RANK == 0:
+        print("Wannier90 k-points assigned per MPI rank:", local_counts)
+    w90.run()
+    if MPI_RANK == 0:
+        print("SCF energy (Hartree/cell):", kmf.e_tot)
+        print(
+            "Retained all-electron bands:",
+            FIRST_VALENCE_BAND,
+            "through",
+            LAST_VALENCE_BAND,
+        )
+        print("Converged:", w90.converged)
+        print("Centers (Angstrom):\n", w90.wann_centres)
+        print("Spatial spreads (Angstrom^2):\n", w90.wann_spreads)
+        print(
+            "Per-orbital space-energy data:",
+            output / "si_valence_all_electron_dlwf.info",
+        )
