@@ -216,9 +216,24 @@ class Wannier90V4Library:
             function = getattr(self.lib, name)
             function.argtypes = argtypes
             function.restype = None
+        if hasattr(self.lib, "w90_get_sitesym_support_version"):
+            self.lib.w90_get_sitesym_support_version.argtypes = []
+            self.lib.w90_get_sitesym_support_version.restype = ctypes.c_int
         if hasattr(self.lib, "w90_set_comm_f"):
             self.lib.w90_set_comm_f.argtypes = [data, int_p]
             self.lib.w90_set_comm_f.restype = None
+
+    def require_site_symmetry_support(self) -> None:
+        """Reject native libraries that predate safe library-mode ``.dmn`` loading."""
+
+        marker = getattr(self.lib, "w90_get_sitesym_support_version", None)
+        version = 0 if marker is None else int(marker())
+        if version < 1:
+            raise Wannier90Error(
+                "The loaded Wannier90 library does not support site_symmetry "
+                "through the v4 library API. Rebuild and reinstall the current "
+                f"DLWF Wannier90 source, then verify PYWANNIER90_LIB points to it: {self.path}"
+            )
 
     def set_communicator(self, mpi_comm: Any | None = None) -> None:
         """Attach an mpi4py-compatible communicator to an MPI Wannier90 build."""
@@ -1630,6 +1645,8 @@ class W90:
             raise RuntimeError("This W90 instance has already been set up")
         library = Wannier90V4Library(self.library_path, mpi_comm=self.mpi_comm)
         try:
+            if bool(self.options.get("site_symmetry", False)):
+                library.require_site_symmetry_support()
             self.is_mpi = library.is_mpi
             self.mpi_comm = library.mpi_comm
             self.mpi_rank = library.mpi_rank
