@@ -18,6 +18,8 @@ import ctypes
 import ctypes.util
 import os
 import re
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -687,6 +689,651 @@ def _default_kpoint_distribution(num_kpts: int, mpi_size: int) -> np.ndarray:
     return np.repeat(np.arange(mpi_size, dtype=np.int32), counts)
 
 
+@dataclass(frozen=True)
+class SymmetryData:
+    """Wannier90 ``.dmn`` data, using zero-based Python indices.
+
+    Matrix axes follow the native Fortran object: ``(row, column, operation,
+    irreducible_kpoint)``.  Integer indices are converted to one-based values
+    only when :func:`write_dmn` serializes the data.
+    """
+
+    ik2ir: np.ndarray
+    ir2ik: np.ndarray
+    kptsym: np.ndarray
+    d_matrix_wann: np.ndarray
+    d_matrix_band: np.ndarray
+    projection_covariance_residual: float | None = None
+    symmetrized_a_matrix: np.ndarray | None = None
+
+
+def _unitarity_error(matrix: np.ndarray) -> float:
+    identity = np.eye(matrix.shape[0], dtype=np.complex128)
+    return float(np.linalg.norm(matrix.conj().T @ matrix - identity, ord="fro"))
+
+
+def validate_symmetry_data(
+    data: SymmetryData,
+    *,
+    unitarity_tolerance: float = 1.0e-7,
+) -> None:
+    """Validate dimensions, mesh maps, and unitary representations."""
+
+    ik2ir = np.asarray(data.ik2ir)
+    ir2ik = np.asarray(data.ir2ik)
+    kptsym = np.asarray(data.kptsym)
+    d_wann = np.asarray(data.d_matrix_wann)
+    d_band = np.asarray(data.d_matrix_band)
+    if ik2ir.ndim != 1 or ir2ik.ndim != 1 or kptsym.ndim != 2:
+        raise ValueError("Symmetry maps must have shapes (nk), (nkirr), and (nsym,nkirr)")
+    nk = ik2ir.size
+    nkirr = ir2ik.size
+    nsym = kptsym.shape[0]
+    if kptsym.shape[1] != nkirr:
+        raise ValueError("kptsym has an irreducible-k-point dimension inconsistent with ir2ik")
+    if d_wann.ndim != 4 or d_wann.shape[2:] != (nsym, nkirr):
+        raise ValueError(
+            "d_matrix_wann must have shape (num_wann,num_wann,nsym,nkirr)"
+        )
+    if d_wann.shape[0] != d_wann.shape[1]:
+        raise ValueError("d_matrix_wann matrices must be square")
+    if d_band.ndim != 4 or d_band.shape[2:] != (nsym, nkirr):
+        raise ValueError(
+            "d_matrix_band must have shape (num_bands,num_bands,nsym,nkirr)"
+        )
+    if d_band.shape[0] != d_band.shape[1]:
+        raise ValueError("d_matrix_band matrices must be square")
+    if nk < 1 or nkirr < 1 or nsym < 1:
+        raise ValueError("Symmetry data must contain k-points and operations")
+    if np.any(ik2ir < 0) or np.any(ik2ir >= nkirr):
+        raise ValueError("ik2ir contains an irreducible-k-point index out of range")
+    if np.any(ir2ik < 0) or np.any(ir2ik >= nk) or np.unique(ir2ik).size != nkirr:
+        raise ValueError("ir2ik must contain distinct full-BZ k-point indices")
+    if not np.array_equal(ik2ir[ir2ik], np.arange(nkirr)):
+        raise ValueError("ik2ir and ir2ik are not inverse on irreducible k-points")
+    if np.any(kptsym < 0) or np.any(kptsym >= nk):
+        raise ValueError("kptsym contains a full-BZ k-point index out of range")
+    if not np.array_equal(kptsym[0], ir2ik):
+        raise ValueError("The first symmetry operation in kptsym must be the identity")
+    for ir in range(nkirr):
+        if np.any(ik2ir[kptsym[:, ir]] != ir):
+            raise ValueError(
+                f"kptsym operation images leave irreducible star {ir}"
+            )
+        star = np.flatnonzero(ik2ir == ir)
+        if not np.all(np.isin(star, kptsym[:, ir])):
+            raise ValueError(f"Symmetry operations do not cover k-point star {ir}")
+    if not np.isfinite(d_wann).all() or not np.isfinite(d_band).all():
+        raise ValueError("Symmetry representation matrices contain NaN or infinity")
+    if data.symmetrized_a_matrix is not None:
+        symmetrized_a = np.asarray(data.symmetrized_a_matrix)
+        expected = (d_band.shape[0], d_wann.shape[0], nk)
+        if symmetrized_a.shape != expected:
+            raise ValueError(
+                f"symmetrized_a_matrix must have shape {expected}, got "
+                f"{symmetrized_a.shape}"
+            )
+        if not np.isfinite(symmetrized_a).all():
+            raise ValueError("symmetrized_a_matrix contains NaN or infinity")
+    for name, matrices in (("band", d_band), ("Wannier", d_wann)):
+        for ir in range(nkirr):
+            for isym in range(nsym):
+                error = _unitarity_error(matrices[:, :, isym, ir])
+                if error > unitarity_tolerance:
+                    raise ValueError(
+                        f"{name} symmetry matrix is not unitary at irreducible "
+                        f"k-point {ir}, operation {isym}: residual={error:.3e}, "
+                        f"tolerance={unitarity_tolerance:.3e}"
+                    )
+
+
+def symmetrize_projection_matrix(
+    a_matrix: np.ndarray,
+    data: SymmetryData,
+    *,
+    tolerance: float = 1.0e-6,
+    rank_tolerance: float = 1.0e-10,
+) -> np.ndarray:
+    """Project ``A(k)`` onto the supplied symmetry representation.
+
+    Each irreducible representative is little-group averaged and replaced by
+    its closest column-orthonormal matrix.  It is then transported over the
+    star.  Agreement of all duplicate transports checks the compatibility of
+    the band and Wannier representations independently of the raw A gauge.
+    """
+
+    validate_symmetry_data(data)
+    a_matrix = np.asarray(a_matrix, dtype=np.complex128)
+    nb = data.d_matrix_band.shape[0]
+    nw = data.d_matrix_wann.shape[0]
+    nk = data.ik2ir.size
+    if a_matrix.shape != (nb, nw, nk):
+        raise ValueError(
+            f"A matrix must have shape {(nb, nw, nk)} for symmetry projection, "
+            f"got {a_matrix.shape}"
+        )
+    result = np.empty((nb, nw, nk), dtype=np.complex128, order="F")
+    assigned = np.zeros(nk, dtype=bool)
+    for ir, representative_value in enumerate(data.ir2ik):
+        representative = int(representative_value)
+        little_group = np.flatnonzero(data.kptsym[:, ir] == representative)
+        averaged = np.zeros((nb, nw), dtype=np.complex128)
+        for isym_value in little_group:
+            isym = int(isym_value)
+            averaged += (
+                data.d_matrix_band[:, :, isym, ir]
+                @ a_matrix[:, :, representative]
+                @ data.d_matrix_wann[:, :, isym, ir].conj().T
+            )
+        averaged /= little_group.size
+        left, singular_values, right = np.linalg.svd(averaged, full_matrices=False)
+        if (
+            singular_values.size < nw
+            or singular_values[-1] <= rank_tolerance * singular_values[0]
+        ):
+            raise ValueError(
+                "Little-group-averaged projection matrix is rank deficient at "
+                f"irreducible k-point {representative}; the requested Wannier "
+                "representation is incompatible with the selected bands"
+            )
+        representative_matrix = left @ right
+        for isym in range(data.kptsym.shape[0]):
+            target = int(data.kptsym[isym, ir])
+            transported = (
+                data.d_matrix_band[:, :, isym, ir]
+                @ representative_matrix
+                @ data.d_matrix_wann[:, :, isym, ir].conj().T
+            )
+            if assigned[target]:
+                residual = float(
+                    np.linalg.norm(result[:, :, target] - transported, ord="fro")
+                    / np.sqrt(float(nw))
+                )
+                if residual > tolerance:
+                    raise ValueError(
+                        "Symmetry transports disagree for k-point "
+                        f"{target} in star {ir}: residual={residual:.3e}, "
+                        f"tolerance={tolerance:.3e}. The band and Wannier "
+                        "representations are incompatible."
+                    )
+            else:
+                result[:, :, target] = transported
+                assigned[target] = True
+    if not np.all(assigned):
+        missing = np.flatnonzero(~assigned).tolist()
+        raise ValueError(f"Symmetry transport did not initialize k-points {missing}")
+    return result
+
+
+def _same_fractional_site(first: np.ndarray, second: np.ndarray, tolerance: float) -> bool:
+    difference = np.asarray(first) - np.asarray(second)
+    return bool(np.max(np.abs(difference - np.rint(difference))) <= tolerance)
+
+
+def _projection_value_on_directions(
+    projection_data: Mapping[str, np.ndarray],
+    index: int,
+    directions: np.ndarray,
+) -> np.ndarray:
+    local = np.asarray(directions, dtype=np.float64) @ _transform_axes(
+        projection_data["x_axis"][:, index],
+        projection_data["z_axis"][:, index],
+    ).T
+    radius = np.linalg.norm(local, axis=1)
+    cost = np.clip(local[:, 2] / radius, -1.0, 1.0)
+    phi = np.arctan2(local[:, 1], local[:, 0])
+    return _theta_lmr(
+        int(projection_data["l"][index]),
+        int(projection_data["m"][index]),
+        cost,
+        phi,
+    )
+
+
+def _build_wannier_representation_from_projection_metadata(
+    cell: Any,
+    symmetry: Any,
+    operation_ids: np.ndarray,
+    ir2ik: np.ndarray,
+    kptsym: np.ndarray,
+    projection_data: Mapping[str, np.ndarray],
+    num_wann: int,
+    *,
+    closure_tolerance: float,
+    site_tolerance: float = 1.0e-7,
+) -> np.ndarray:
+    """Represent scalar Wannier90 projectors under PySCF space-group ops."""
+
+    required = ("site", "l", "m", "radial", "zona", "x_axis", "z_axis")
+    missing = [name for name in required if name not in projection_data]
+    if missing:
+        raise ValueError(
+            "Projection metadata needed for site symmetry are missing: "
+            + ", ".join(missing)
+        )
+    metadata = {name: np.asarray(projection_data[name]) for name in required}
+    if metadata["site"].shape != (3, num_wann):
+        raise ValueError("Projection sites must have shape (3,num_wann)")
+    if metadata["x_axis"].shape != (3, num_wann) or metadata["z_axis"].shape != (
+        3,
+        num_wann,
+    ):
+        raise ValueError("Projection axes must have shape (3,num_wann)")
+    for name in ("l", "m", "radial", "zona"):
+        if metadata[name].shape != (num_wann,):
+            raise ValueError(f"Projection metadata {name} must have length num_wann")
+
+    # A deterministic, inversion-balanced sphere grid.  It is intentionally
+    # overdetermined for all angular channels currently supported (l <= 3).
+    half_count = max(64, 8 * num_wann)
+    indices = np.arange(half_count, dtype=np.float64)
+    z = (indices + 0.5) / half_count
+    phi = indices * (np.pi * (3.0 - np.sqrt(5.0)))
+    radius_xy = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    hemisphere = np.column_stack(
+        (radius_xy * np.cos(phi), radius_xy * np.sin(phi), z)
+    )
+    directions = np.vstack((hemisphere, -hemisphere))
+
+    sites = metadata["site"].T
+    radial = metadata["radial"]
+    zona = metadata["zona"]
+    source_groups: list[np.ndarray] = []
+    remaining = set(range(num_wann))
+    while remaining:
+        first = min(remaining)
+        group = np.asarray(
+            [
+                index
+                for index in sorted(remaining)
+                if _same_fractional_site(sites[index], sites[first], site_tolerance)
+                and int(radial[index]) == int(radial[first])
+                and np.isclose(zona[index], zona[first], rtol=0.0, atol=site_tolerance)
+            ],
+            dtype=np.int32,
+        )
+        source_groups.append(group)
+        remaining.difference_update(int(index) for index in group)
+
+    nsym = operation_ids.size
+    nkirr = ir2ik.size
+    base_matrices = np.zeros((num_wann, num_wann, nsym), dtype=np.complex128)
+    lattice_shifts = np.zeros((3, num_wann, nsym), dtype=np.int32)
+    for isym, operation_id_value in enumerate(operation_ids):
+        operation = symmetry.ops[int(operation_id_value)]
+        cartesian_rotation = np.asarray(operation.a2r(cell).rot, dtype=np.float64)
+        used_targets: set[int] = set()
+        for source_group in source_groups:
+            source_site = sites[int(source_group[0])]
+            transformed_site = operation.dot_rot(source_site) + operation.trans
+            candidate_targets = [
+                index
+                for index in range(num_wann)
+                if _same_fractional_site(sites[index], transformed_site, site_tolerance)
+                and int(radial[index]) == int(radial[int(source_group[0])])
+                and np.isclose(
+                    zona[index],
+                    zona[int(source_group[0])],
+                    rtol=0.0,
+                    atol=site_tolerance,
+                )
+            ]
+            target_group = np.asarray(candidate_targets, dtype=np.int32)
+            if target_group.size != source_group.size:
+                raise ValueError(
+                    "Projection set is not closed under the space group: "
+                    f"operation {int(operation_id_value)} maps a group of "
+                    f"{source_group.size} projector(s) at {source_site.tolist()} "
+                    f"onto {target_group.size} compatible projector(s)"
+                )
+            if any(int(index) in used_targets for index in target_group):
+                raise ValueError(
+                    "Projection metadata do not define a one-to-one site-symmetry map"
+                )
+            used_targets.update(int(index) for index in target_group)
+
+            target_values = np.column_stack(
+                [
+                    _projection_value_on_directions(metadata, int(index), directions)
+                    for index in target_group
+                ]
+            )
+            # For an active operation r' = R r, the transformed source
+            # function is evaluated at R^{-1} r.  Coordinates are row vectors.
+            inverse_rotated_directions = directions @ cartesian_rotation
+            transformed_values = np.column_stack(
+                [
+                    _projection_value_on_directions(
+                        metadata, int(index), inverse_rotated_directions
+                    )
+                    for index in source_group
+                ]
+            )
+            mixing = np.linalg.lstsq(target_values, transformed_values, rcond=None)[0]
+            left, _, right = np.linalg.svd(mixing)
+            mixing = left @ right
+            angular_residual = float(
+                np.linalg.norm(target_values @ mixing - transformed_values, ord="fro")
+                / max(np.linalg.norm(transformed_values, ord="fro"), 1.0e-300)
+            )
+            if angular_residual > closure_tolerance:
+                raise ValueError(
+                    "Projection angular functions are not closed under the "
+                    f"space group for operation {int(operation_id_value)}: "
+                    f"relative residual={angular_residual:.3e}, "
+                    f"tolerance={closure_tolerance:.3e}"
+                )
+            base_matrices[np.ix_(target_group, source_group, [isym])] = mixing[:, :, None]
+            for source_index in source_group:
+                shift = transformed_site - sites[int(target_group[0])]
+                rounded_shift = np.rint(shift)
+                if np.max(np.abs(shift - rounded_shift)) > site_tolerance:
+                    raise ValueError(
+                        "Projection-site symmetry mapping has a non-lattice translation"
+                    )
+                lattice_shifts[:, int(source_index), isym] = rounded_shift.astype(
+                    np.int32
+                )
+        if len(used_targets) != num_wann:
+            raise ValueError(
+                f"Symmetry operation {int(operation_id_value)} does not map all projectors"
+            )
+
+    result = np.empty(
+        (num_wann, num_wann, nsym, nkirr), dtype=np.complex128, order="F"
+    )
+    for ir in range(nkirr):
+        for isym in range(nsym):
+            target_kpoint = int(kptsym[isym, ir])
+            target_scaled = np.asarray(symmetry.kpts_scaled[target_kpoint])
+            phases = np.exp(
+                -2.0j
+                * np.pi
+                * np.einsum(
+                    "i,ij->j", target_scaled, lattice_shifts[:, :, isym]
+                )
+            )
+            result[:, :, isym, ir] = base_matrices[:, :, isym] * phases[None, :]
+    return result
+
+
+def build_symmetry_data(
+    cell: Any,
+    kpts: np.ndarray,
+    mo_coeff: np.ndarray,
+    a_matrix: np.ndarray,
+    *,
+    projection_data: Mapping[str, np.ndarray] | None = None,
+    band_subspace_tolerance: float = 1.0e-6,
+    projection_tolerance: float = 1.0e-6,
+    projection_rank_tolerance: float = 1.0e-10,
+    unitarity_tolerance: float = 1.0e-7,
+) -> SymmetryData:
+    """Build Wannier90 site-symmetry data from PySCF operations and ``A(k)``.
+
+    Time reversal is intentionally excluded because ``.dmn`` stores unitary
+    space-group representations.  The full (including nonsymmorphic)
+    space group is retained, and the supplied k mesh must be closed under
+    every operation.  PySCF's MO rotation is adjointed to obtain Wannier90's
+    convention ``U(Rk) = d(R,k) U(k) D(R,k)^dagger``.
+    """
+
+    from pyscf.pbc.lib.kpts import KPoints
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    coeff = np.asarray(mo_coeff, dtype=np.complex128)
+    a_matrix = np.asarray(a_matrix, dtype=np.complex128)
+    if kpts.ndim != 2 or kpts.shape[1] != 3:
+        raise ValueError("kpts must have shape (num_kpts,3)")
+    if coeff.ndim != 3 or coeff.shape[0] != kpts.shape[0]:
+        raise ValueError("mo_coeff must have shape (num_kpts,num_ao,num_bands)")
+    nk, _, nb = coeff.shape
+    if a_matrix.ndim != 3 or a_matrix.shape[0] != nb or a_matrix.shape[2] != nk:
+        raise ValueError("A matrix must have shape (num_bands,num_wann,num_kpts)")
+    nw = a_matrix.shape[1]
+    if nb < nw:
+        raise ValueError("The symmetry band subspace cannot be smaller than num_wann")
+
+    symmetry = KPoints(cell, kpts)
+    symmetry.verbose = 0
+    symmetry.build(
+        space_group_symmetry=True,
+        time_reversal_symmetry=False,
+        symmorphic=False,
+        # This matrix construction uses analytic AO rotations.  Validate the
+        # k mesh below, rather than silently dropping operations according to
+        # an unrelated FFT quadrature mesh.
+        check_mesh_symmetry=False,
+    )
+    identity_operations = [
+        index
+        for index, operation in enumerate(symmetry.ops)
+        if operation.is_eye and operation.trans_is_zero
+    ]
+    if len(identity_operations) != 1:
+        raise ValueError(
+            "PySCF space-group operations do not contain exactly one identity"
+        )
+    identity = identity_operations[0]
+    operation_ids = np.asarray(
+        [identity]
+        + [index for index in range(symmetry.nop) if index != identity],
+        dtype=np.int32,
+    )
+    operation_map = np.asarray(symmetry.k2opk[:, operation_ids], dtype=np.int64)
+    if operation_map.shape != (nk, operation_ids.size) or np.any(operation_map < 0):
+        raise ValueError(
+            "The PySCF k-point mesh is not closed under the full space group; "
+            "use a symmetry-compatible Monkhorst-Pack mesh"
+        )
+    for isym in range(operation_ids.size):
+        if np.unique(operation_map[:, isym]).size != nk:
+            raise ValueError(
+                f"Symmetry operation {int(operation_ids[isym])} is not a "
+                "permutation of the supplied k-point mesh"
+            )
+
+    ik2ir = np.asarray(symmetry.bz2ibz, dtype=np.int32)
+    ir2ik = np.asarray(symmetry.ibz2bz, dtype=np.int32)
+    nkirr = ir2ik.size
+    nsym = operation_ids.size
+    kptsym = np.empty((nsym, nkirr), dtype=np.int32)
+    for ir, k_index_value in enumerate(ir2ik):
+        kptsym[:, ir] = operation_map[int(k_index_value)]
+    d_band = np.empty((nb, nb, nsym, nkirr), dtype=np.complex128, order="F")
+    d_wann = np.empty((nw, nw, nsym, nkirr), dtype=np.complex128, order="F")
+    overlaps = np.asarray(cell.pbc_intor("int1e_ovlp", hermi=1, kpts=kpts))
+    if overlaps.shape != (nk, coeff.shape[1], coeff.shape[1]):
+        raise ValueError("PySCF AO overlap dimensions do not match mo_coeff")
+    if projection_data is not None:
+        d_wann[:, :, :, :] = _build_wannier_representation_from_projection_metadata(
+            cell,
+            symmetry,
+            operation_ids,
+            ir2ik,
+            kptsym,
+            projection_data,
+            nw,
+            closure_tolerance=projection_tolerance,
+        )
+
+    maximum_projection_residual = 0.0
+
+    for ir, k_index_value in enumerate(ir2ik):
+        k_index = int(k_index_value)
+        targets = operation_map[k_index]
+        kptsym[:, ir] = targets
+        rotations = symmetry.get_rotation_mat_for_mos(
+            coeff,
+            overlaps,
+            np.full(nsym, k_index, dtype=np.int32),
+            targets,
+            ops_id=operation_ids,
+        )
+        for isym, rotation_list in enumerate(rotations):
+            raw_band = np.asarray(rotation_list[0]).conj().T
+            left, singular_values, right = np.linalg.svd(raw_band)
+            closure_error = float(np.max(np.abs(singular_values - 1.0)))
+            if closure_error > band_subspace_tolerance:
+                raise ValueError(
+                    "Selected PySCF bands are not closed under the space group "
+                    f"at k-point {k_index}, operation {int(operation_ids[isym])}: "
+                    f"max singular-value error={closure_error:.3e}, "
+                    f"tolerance={band_subspace_tolerance:.3e}. Adjust exclude_bands "
+                    "or the outer disentanglement window."
+                )
+            band_matrix = left @ right
+            d_band[:, :, isym, ir] = band_matrix
+
+            target = int(targets[isym])
+            transformed_projection = band_matrix @ a_matrix[:, :, k_index]
+            if projection_data is not None:
+                residual = float(
+                    np.linalg.norm(
+                        transformed_projection
+                        @ d_wann[:, :, isym, ir].conj().T
+                        - a_matrix[:, :, target],
+                        ord="fro",
+                    )
+                    / max(
+                        np.linalg.norm(a_matrix[:, :, target], ord="fro"),
+                        1.0e-300,
+                    )
+                )
+                maximum_projection_residual = max(
+                    maximum_projection_residual, residual
+                )
+                continue
+            projection_singular_values = np.linalg.svd(
+                transformed_projection, compute_uv=False
+            )
+            if (
+                projection_singular_values.size < nw
+                or projection_singular_values[-1]
+                <= projection_rank_tolerance * projection_singular_values[0]
+            ):
+                raise ValueError(
+                    "Projection A matrix is rank deficient at k-point "
+                    f"{k_index}, operation {int(operation_ids[isym])}; the "
+                    "projection set cannot define a num_wann-dimensional "
+                    "site-symmetry representation"
+                )
+            d_dagger_raw = np.linalg.lstsq(
+                transformed_projection, a_matrix[:, :, target], rcond=None
+            )[0]
+            left, _, right = np.linalg.svd(d_dagger_raw)
+            d_dagger = left @ right
+            residual = float(
+                np.linalg.norm(
+                    transformed_projection @ d_dagger - a_matrix[:, :, target],
+                    ord="fro",
+                )
+                / max(np.linalg.norm(a_matrix[:, :, target], ord="fro"), 1.0e-300)
+            )
+            if residual > projection_tolerance:
+                raise ValueError(
+                    "Projection A matrices are not closed under the space group "
+                    f"at k-point {k_index}, operation {int(operation_ids[isym])}: "
+                    f"relative covariance residual={residual:.3e}, "
+                    f"tolerance={projection_tolerance:.3e}. Use a symmetry-closed "
+                    "projection set and symmetry-consistent projection quadrature."
+                )
+            d_wann[:, :, isym, ir] = d_dagger.conj().T
+
+    if projection_data is not None and maximum_projection_residual > projection_tolerance:
+        warnings.warn(
+            "Projection A covariance is numerically inconsistent with the "
+            "metadata-derived site-symmetry representation: maximum relative "
+            f"residual={maximum_projection_residual:.3e}. The .dmn representation "
+            "uses projection sites/angular functions; A(k) is only an initial "
+            "guess and does not alter the symmetry constraints.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    data_without_seed = SymmetryData(
+        ik2ir,
+        ir2ik,
+        kptsym,
+        d_wann,
+        d_band,
+        maximum_projection_residual,
+    )
+    symmetrized_a = symmetrize_projection_matrix(
+        a_matrix,
+        data_without_seed,
+        tolerance=max(projection_tolerance, 10.0 * band_subspace_tolerance),
+        rank_tolerance=projection_rank_tolerance,
+    )
+    data = SymmetryData(
+        ik2ir,
+        ir2ik,
+        kptsym,
+        d_wann,
+        d_band,
+        maximum_projection_residual,
+        symmetrized_a,
+    )
+    validate_symmetry_data(data, unitarity_tolerance=unitarity_tolerance)
+    return data
+
+
+def _write_integer_block(handle: Any, values: np.ndarray) -> None:
+    flattened = np.asarray(values).ravel(order="F") + 1
+    for start in range(0, flattened.size, 10):
+        handle.write("".join(f"{int(value):9d}" for value in flattened[start : start + 10]))
+        handle.write("\n")
+
+
+def _write_complex_matrices(handle: Any, matrices: np.ndarray) -> None:
+    rows, columns, nsym, nkirr = matrices.shape
+    for ir in range(nkirr):
+        for isym in range(nsym):
+            for column in range(columns):
+                for row in range(rows):
+                    value = matrices[row, column, isym, ir]
+                    handle.write(f" ({value.real:22.14E},{value.imag:22.14E})\n")
+            handle.write("\n")
+
+
+def write_dmn(
+    path: str | os.PathLike[str],
+    data: SymmetryData,
+    *,
+    atomic: bool = False,
+) -> Path:
+    """Write validated symmetry data in Wannier90's formatted ``.dmn`` layout."""
+
+    validate_symmetry_data(data)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    output = destination.with_name(f".{destination.name}.tmp-{os.getpid()}") if atomic else destination
+    nb = data.d_matrix_band.shape[0]
+    nw = data.d_matrix_wann.shape[0]
+    del nw
+    nsym, nkirr = data.kptsym.shape
+    nk = data.ik2ir.size
+    try:
+        with output.open("w", encoding="utf-8") as handle:
+            handle.write(" Generated by pywannier90_v4\n")
+            handle.write(f"{nb:9d}{nsym:9d}{nkirr:9d}{nk:9d}\n\n")
+            _write_integer_block(handle, data.ik2ir)
+            handle.write("\n")
+            _write_integer_block(handle, data.ir2ik)
+            handle.write("\n")
+            for ir in range(nkirr):
+                _write_integer_block(handle, data.kptsym[:, ir])
+                handle.write("\n")
+            _write_complex_matrices(handle, data.d_matrix_wann)
+            _write_complex_matrices(handle, data.d_matrix_band)
+        if atomic:
+            os.replace(output, destination)
+    except Exception:
+        if atomic and output.exists():
+            output.unlink()
+        raise
+    return destination
+
+
 class W90:
     """Wannier90 v4 workflow for periodic PySCF mean-field objects.
 
@@ -727,6 +1374,9 @@ class W90:
         options: Mapping[str, Any] | None = None,
         mpi_comm: Any | None = None,
         kpoint_distribution: Sequence[int] | None = None,
+        symmetry_data: SymmetryData | None = None,
+        symmetry_band_tolerance: float = 1.0e-6,
+        symmetry_projection_tolerance: float = 1.0e-6,
     ):
         if spinors:
             raise NotImplementedError("Spinor PySCF wavefunctions are not yet supported")
@@ -746,6 +1396,13 @@ class W90:
             if kpoint_distribution is None
             else np.asarray(kpoint_distribution, dtype=np.int32)
         )
+        self.requested_symmetry_data = symmetry_data
+        self.symmetry_band_tolerance = float(symmetry_band_tolerance)
+        self.symmetry_projection_tolerance = float(symmetry_projection_tolerance)
+        if self.symmetry_band_tolerance <= 0.0:
+            raise ValueError("symmetry_band_tolerance must be positive")
+        if self.symmetry_projection_tolerance <= 0.0:
+            raise ValueError("symmetry_projection_tolerance must be positive")
         self.seedname = str(Path(seedname).expanduser().resolve())
 
         legacy_options = _parse_legacy_keywords(other_keywords)
@@ -822,6 +1479,7 @@ class W90:
         self.wann_centres: np.ndarray | None = None
         self.wann_spreads: np.ndarray | None = None
         self.converged: bool | None = None
+        self.symmetry_data: SymmetryData | None = None
 
         self._validate_dlwf_options()
 
@@ -866,8 +1524,14 @@ class W90:
             return
         if self.gamma_only:
             raise ValueError("Wannier90 v4 space-energy localization does not support gamma_only")
+        if bool(self.options.get("site_symmetry", False)) and any(
+            key in self.options for key in ("dis_froz_min", "dis_froz_max")
+        ):
+            raise ValueError(
+                "Wannier90 site-symmetry disentanglement does not support an "
+                "inner (frozen) energy window"
+            )
         incompatible = {
-            "site_symmetry": True,
             "selective_loc": True,
             "use_ss_functional": True,
             "precond": True,
@@ -878,6 +1542,88 @@ class W90:
                 "Wannier90 v4 space-energy localization is incompatible with: "
                 + ", ".join(enabled)
             )
+
+    def _prepare_symmetry_file(self, a_matrix: np.ndarray) -> np.ndarray:
+        """Generate and publish ``seedname.dmn`` before native disentanglement."""
+
+        if not bool(getattr(self, "options", {}).get("site_symmetry", False)):
+            return a_matrix
+        if self.num_bands is None:
+            raise RuntimeError("Call setup() before generating site-symmetry data")
+
+        def build_and_write() -> np.ndarray:
+            data = self.requested_symmetry_data
+            if data is None:
+                coefficients = self.mo_coeff[:, :, self.band_included_list]
+                data = build_symmetry_data(
+                    self.cell,
+                    self.kpts,
+                    coefficients,
+                    a_matrix,
+                    projection_data=self.projection_data,
+                    band_subspace_tolerance=self.symmetry_band_tolerance,
+                    projection_tolerance=self.symmetry_projection_tolerance,
+                )
+            validate_symmetry_data(data)
+            expected_band_shape = (self.num_bands, self.num_bands)
+            expected_wann_shape = (self.num_wann, self.num_wann)
+            if data.d_matrix_band.shape[:2] != expected_band_shape:
+                raise ValueError(
+                    "Symmetry band representation dimensions do not match the "
+                    f"included bands: expected {expected_band_shape}, got "
+                    f"{data.d_matrix_band.shape[:2]}"
+                )
+            if data.d_matrix_wann.shape[:2] != expected_wann_shape:
+                raise ValueError(
+                    "Symmetry Wannier representation dimensions do not match "
+                    f"num_wann: expected {expected_wann_shape}, got "
+                    f"{data.d_matrix_wann.shape[:2]}"
+                )
+            if data.ik2ir.size != self.num_kpts:
+                raise ValueError(
+                    "Symmetry k-point count does not match the PySCF mesh: "
+                    f"expected {self.num_kpts}, got {data.ik2ir.size}"
+                )
+            prepared_a = data.symmetrized_a_matrix
+            if prepared_a is None:
+                prepared_a = symmetrize_projection_matrix(
+                    a_matrix,
+                    data,
+                    tolerance=max(
+                        self.symmetry_projection_tolerance,
+                        10.0 * self.symmetry_band_tolerance,
+                    ),
+                )
+            write_dmn(self.seedname + ".dmn", data, atomic=True)
+            self.symmetry_data = data
+            return np.asfortranarray(prepared_a, dtype=np.complex128)
+
+        if not self.is_mpi:
+            return build_and_write()
+        communicator = self.mpi_comm
+        if communicator is None or not hasattr(communicator, "bcast") or not hasattr(
+            communicator, "Barrier"
+        ):
+            raise TypeError(
+                "MPI site-symmetry setup requires communicator.bcast and "
+                "communicator.Barrier"
+            )
+        failure: tuple[str, str] | None = None
+        prepared_a: np.ndarray | None = None
+        if self.mpi_rank == 0:
+            try:
+                prepared_a = build_and_write()
+            except Exception as exc:  # distribute the failure before any barrier
+                failure = (type(exc).__name__, str(exc))
+        failure, prepared_a = communicator.bcast((failure, prepared_a), root=0)
+        if failure is not None:
+            raise ValueError(
+                f"Rank-0 site-symmetry setup failed ({failure[0]}): {failure[1]}"
+            )
+        communicator.Barrier()
+        if prepared_a is None:
+            raise RuntimeError("Rank 0 did not broadcast a symmetry-projected A matrix")
+        return np.asfortranarray(prepared_a, dtype=np.complex128)
 
     def setup(self) -> None:
         if self.library is not None:
@@ -1092,6 +1838,7 @@ class W90:
         self.M_matrix_local = self.M_matrix
         self.A_matrix = np.asfortranarray(a_matrix, dtype=np.complex128)
         self.eigenvalues = np.asfortranarray(eigenvalues, dtype=np.float64)
+        self.A_matrix = self._prepare_symmetry_file(self.A_matrix)
         self.u_matrix = np.zeros(
             (self.num_wann, self.num_wann, self.num_kpts),
             dtype=np.complex128,
@@ -1342,8 +2089,13 @@ class W90:
 
 
 __all__ = [
+    "SymmetryData",
     "W90",
     "Wannier90Error",
     "Wannier90V4Library",
+    "build_symmetry_data",
     "projection_function",
+    "symmetrize_projection_matrix",
+    "validate_symmetry_data",
+    "write_dmn",
 ]

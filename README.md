@@ -169,6 +169,22 @@ k-point mean-field result, and options. PySCF's SCF calculation is not made
 MPI-parallel by this interface; for large jobs, load or reconstruct the same
 converged mean-field data on every rank before calling `W90`.
 
+The silicon valence-plus-conduction example demonstrates a staged hybrid job.
+Its `scf` stage runs one threaded PySCF process and writes a reusable orbital
+file; its `localize` stage loads that file on rank 0, broadcasts the orbitals,
+and runs Wannier90 with one thread per MPI rank. The bundled Slurm script
+reuses the same CPU allocation for both stages:
+
+```bash
+sbatch examples/PySCF/si_444_mpi.slurm
+
+# The two stages can also be launched separately.
+PYWANNIER90_STAGE=scf PYSCF_SCF_THREADS=4 \
+  python examples/PySCF/si_444_valence_conduction_v4.py
+PYWANNIER90_STAGE=localize PYWANNIER90_EXPECT_MPI_RANKS=4 \
+  mpiexec -n 4 python examples/PySCF/si_444_valence_conduction_v4.py
+```
+
 The serial and MPI installations can coexist under their different default
 prefixes. Source only the activation file for the variant needed by the job.
 

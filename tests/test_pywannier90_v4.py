@@ -18,12 +18,17 @@ from unittest import mock
 import numpy as np
 
 from pywannier90_v4 import (
+    SymmetryData,
     W90,
     Wannier90V4Library,
     _W90Data,
     _default_kpoint_distribution,
     _parse_legacy_keywords,
+    build_symmetry_data,
     projection_function,
+    symmetrize_projection_matrix,
+    validate_symmetry_data,
+    write_dmn,
 )
 
 
@@ -157,6 +162,141 @@ class MPISupportTests(unittest.TestCase):
             adapter.library.attached_m.reshape(-1), np.array([1.0, 3.0])
         )
         self.assertTrue(adapter.M_matrix_local.flags.f_contiguous)
+
+
+class SiteSymmetryTests(unittest.TestCase):
+    @staticmethod
+    def _identity_data(num_kpts=1):
+        return SymmetryData(
+            ik2ir=np.arange(num_kpts, dtype=np.int32),
+            ir2ik=np.arange(num_kpts, dtype=np.int32),
+            kptsym=np.arange(num_kpts, dtype=np.int32)[None, :],
+            d_matrix_wann=np.ones(
+                (1, 1, 1, num_kpts), dtype=np.complex128
+            ),
+            d_matrix_band=np.ones(
+                (1, 1, 1, num_kpts), dtype=np.complex128
+            ),
+        )
+
+    def test_dmn_writer_uses_one_based_maps_and_native_header(self):
+        data = self._identity_data(2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_dmn(Path(directory) / "test.dmn", data, atomic=True)
+            lines = path.read_text().splitlines()
+        self.assertEqual([int(value) for value in lines[1].split()], [1, 1, 2, 2])
+        integer_lines = [line.split() for line in lines[3:11] if line.strip()]
+        self.assertEqual(integer_lines[:4], [["1", "2"], ["1", "2"], ["1"], ["2"]])
+        self.assertFalse(any(path.parent.glob(".test.dmn.tmp-*")))
+
+    def test_nonunitary_representation_is_rejected(self):
+        data = self._identity_data()
+        data.d_matrix_band[0, 0, 0, 0] = 2.0
+        with self.assertRaisesRegex(ValueError, "not unitary"):
+            validate_symmetry_data(data)
+
+    def test_projection_seed_is_transported_over_each_kpoint_star(self):
+        phase = np.exp(0.37j)
+        data = SymmetryData(
+            ik2ir=np.array([0, 0], dtype=np.int32),
+            ir2ik=np.array([0], dtype=np.int32),
+            kptsym=np.array([[0], [1]], dtype=np.int32),
+            d_matrix_wann=np.ones((1, 1, 2, 1), dtype=np.complex128),
+            d_matrix_band=np.array([[[[1.0], [phase]]]]),
+        )
+        raw = np.array([[[2.0, -3.0j]]], dtype=np.complex128)
+        prepared = symmetrize_projection_matrix(raw, data)
+        self.assertAlmostEqual(abs(prepared[0, 0, 0]), 1.0)
+        np.testing.assert_allclose(prepared[0, 0, 1], phase * prepared[0, 0, 0])
+
+    def test_rank_zero_writes_then_barriers(self):
+        class FakeComm:
+            barriers = 0
+
+            @staticmethod
+            def bcast(value, root):
+                self.assertEqual(root, 0)
+                return value
+
+            def Barrier(self):
+                self.barriers += 1
+
+        adapter = object.__new__(W90)
+        adapter.options = {"site_symmetry": True, "sp_en_mix": 0.5}
+        adapter.num_bands = 1
+        adapter.num_wann = 1
+        adapter.num_kpts = 1
+        adapter.is_mpi = True
+        adapter.mpi_rank = 0
+        adapter.mpi_comm = FakeComm()
+        adapter.requested_symmetry_data = self._identity_data()
+        adapter.symmetry_data = None
+        adapter.symmetry_projection_tolerance = 1.0e-6
+        adapter.symmetry_band_tolerance = 1.0e-6
+        with tempfile.TemporaryDirectory() as directory:
+            adapter.seedname = str(Path(directory) / "rank_zero")
+            adapter._prepare_symmetry_file(np.ones((1, 1, 1)))
+            self.assertTrue(Path(adapter.seedname + ".dmn").is_file())
+        self.assertEqual(adapter.mpi_comm.barriers, 1)
+        self.assertIs(adapter.symmetry_data, adapter.requested_symmetry_data)
+
+    def test_dlwf_site_symmetry_is_accepted_by_python_validation(self):
+        adapter = object.__new__(W90)
+        adapter.options = {"sp_en_mix": 0.5, "site_symmetry": True}
+        adapter.gamma_only = False
+        adapter._validate_dlwf_options()
+
+    def test_dlwf_site_symmetry_rejects_frozen_window(self):
+        adapter = object.__new__(W90)
+        adapter.options = {
+            "sp_en_mix": 0.5,
+            "site_symmetry": True,
+            "dis_froz_max": 3.0,
+        }
+        adapter.gamma_only = False
+        with self.assertRaisesRegex(ValueError, "frozen"):
+            adapter._validate_dlwf_options()
+
+    def test_pyscf_builder_produces_closed_unitary_data(self):
+        try:
+            from pyscf.pbc import gto
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            self.skipTest(str(exc))
+
+        cell = gto.Cell(
+            atom="H 0 0 0",
+            a=np.eye(3) * 5.0,
+            unit="A",
+            basis="sto-3g",
+            mesh=[7, 7, 7],
+            spin=1,
+            verbose=0,
+        ).build()
+        kpts = cell.make_kpts([2, 2, 2])
+        overlaps = np.asarray(cell.pbc_intor("int1e_ovlp", hermi=1, kpts=kpts))
+        coefficients = np.empty((8, 1, 1), dtype=np.complex128)
+        coefficients[:, 0, 0] = 1.0 / np.sqrt(overlaps[:, 0, 0].real)
+        projections = np.ones((1, 1, 8), dtype=np.complex128)
+        projection_data = {
+            "site": np.zeros((3, 1)),
+            "l": np.array([0]),
+            "m": np.array([1]),
+            "radial": np.array([1]),
+            "zona": np.array([1.0]),
+            "x_axis": np.array([[1.0], [0.0], [0.0]]),
+            "z_axis": np.array([[0.0], [0.0], [1.0]]),
+        }
+        data = build_symmetry_data(
+            cell,
+            kpts,
+            coefficients,
+            projections,
+            projection_data=projection_data,
+        )
+        validate_symmetry_data(data)
+        self.assertEqual(data.ik2ir.size, 8)
+        self.assertEqual(data.d_matrix_band.shape[:2], (1, 1))
+        self.assertGreater(data.kptsym.shape[0], 1)
 
 
 class PySCFObjectCompatibilityTests(unittest.TestCase):
