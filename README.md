@@ -23,6 +23,48 @@ disentanglement, Wannierization, centers, spreads, and Wannier-gauge
 Hamiltonians. Spinor wavefunctions are not yet supported. Wannier90 v4 itself
 does not currently allow `gamma_only` with space-energy localization.
 
+### SCDM-k initialization
+
+The v4 adapter can build projection matrices directly from PySCF Bloch
+orbitals with selected columns of the density matrix (SCDM-k). This removes
+the need to choose atomic trial orbitals:
+
+```python
+with W90(
+    kmf,
+    cell,
+    mp_grid=[4, 4, 4],
+    num_wann=8,
+    projections=None,
+    use_bloch_phases=False,
+    scdm_proj=True,
+    scdm_entanglement="erfc",
+    scdm_mu=33.0782,       # eV
+    scdm_sigma=1.2366,     # eV, strictly positive
+    scdm_grid=cell.mesh,   # optional; this is the default
+    exclude_bands=exclude_bands,
+    options={"dis_num_iter": 2000, "num_iter": 1000},
+) as w90:
+    w90.kernel()
+```
+
+The k mesh must include Gamma. At Gamma the adapter evaluates the included
+PySCF orbitals on the uniform real-space grid and uses pivoted QR to select
+`num_wann` representative grid points. It then evaluates the same points at
+every k-point, applies the requested energy filter, and uses the SVD polar
+factor to give the projection matrix orthonormal columns. This follows the
+`pw2wannier90` convention for the A matrix. SCDM construction is performed on
+MPI rank 0 and the comparatively small result is broadcast to other ranks;
+Wannier90's later k-point work remains distributed normally.
+
+Use `scdm_entanglement="isolated"` only when the included manifold already
+has exactly `num_wann` bands. For an entangled outer space, `"erfc"` applies
+`0.5 * erfc((energy - mu) / sigma)` and `"gaussian"` applies
+`exp(-((energy - mu) / sigma)**2)`. All three SCDM energy arguments are in
+electron-volts, matching Quantum ESPRESSO's interface. `scdm_mu`,
+`scdm_sigma`, and the other `scdm_*` controls are constructor arguments, not
+entries in the Wannier90 `options` dictionary.
+
 ### Recommended serial installation for the PySCF interface
 
 When pyWannier90 is checked out as the submodule of the

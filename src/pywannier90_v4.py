@@ -704,6 +704,123 @@ def _default_kpoint_distribution(num_kpts: int, mpi_size: int) -> np.ndarray:
     return np.repeat(np.arange(mpi_size, dtype=np.int32), counts)
 
 
+def scdm_weights(
+    energies_ev: np.ndarray,
+    entanglement: str,
+    mu_ev: float | None = None,
+    sigma_ev: float | None = None,
+) -> np.ndarray:
+    """Return SCDM-k quasi-density-matrix weights.
+
+    ``energies_ev`` and the optional erfc parameters use electron-volts, in
+    agreement with ``pw2wannier90``. Isolated manifolds use the ordinary
+    density matrix and therefore assign unit weight to every included band.
+    """
+
+    energies = np.asarray(energies_ev, dtype=np.float64)
+    if not np.isfinite(energies).all():
+        raise ValueError("SCDM energies must be finite")
+    mode = str(entanglement).lower()
+    if mode == "isolated":
+        return np.ones_like(energies)
+    if mode not in {"erfc", "gaussian"}:
+        raise ValueError(
+            "scdm_entanglement must be 'isolated', 'erfc', or 'gaussian'"
+        )
+    if mu_ev is None or not np.isfinite(mu_ev):
+        raise ValueError("scdm_mu must be finite for filtered SCDM")
+    if sigma_ev is None or not np.isfinite(sigma_ev) or sigma_ev <= 0.0:
+        raise ValueError("scdm_sigma must be positive and finite for filtered SCDM")
+
+    try:
+        from scipy.special import erfc
+    except ImportError as exc:  # pragma: no cover - PySCF depends on SciPy
+        raise ImportError("SCDM initialization requires SciPy") from exc
+    scaled = (energies - float(mu_ev)) / float(sigma_ev)
+    if mode == "erfc":
+        return 0.5 * erfc(scaled)
+    return np.exp(-(scaled**2))
+
+
+def _pivot_scdm_columns(
+    weighted_wavefunctions: np.ndarray,
+    num_wann: int,
+    rank_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select representative grid columns with rank-revealing QRCP."""
+
+    matrix = np.asarray(weighted_wavefunctions, dtype=np.complex128, order="F")
+    if matrix.ndim != 2:
+        raise ValueError("The weighted SCDM wavefunction matrix must be two-dimensional")
+    if not np.isfinite(matrix).all():
+        raise ValueError("The weighted SCDM wavefunction matrix must be finite")
+    if num_wann < 1 or num_wann > min(matrix.shape):
+        raise ValueError(
+            "num_wann must not exceed either SCDM matrix dimension; "
+            f"got num_wann={num_wann} for shape {matrix.shape}"
+        )
+    if not np.isfinite(rank_tolerance) or rank_tolerance <= 0.0:
+        raise ValueError("scdm_rank_tolerance must be positive and finite")
+
+    try:
+        from scipy.linalg import qr
+    except ImportError as exc:  # pragma: no cover - PySCF depends on SciPy
+        raise ImportError("SCDM initialization requires SciPy") from exc
+    _, triangular, pivots = qr(
+        matrix,
+        mode="economic",
+        pivoting=True,
+        overwrite_a=True,
+        check_finite=False,
+    )
+    pivot_diagonal = np.abs(np.diag(triangular))[:num_wann]
+    leading = float(pivot_diagonal[0]) if pivot_diagonal.size else 0.0
+    trailing = float(pivot_diagonal[-1]) if pivot_diagonal.size else 0.0
+    if leading == 0.0 or trailing <= rank_tolerance * leading:
+        raise ValueError(
+            "The weighted SCDM wavefunctions do not span num_wann stable "
+            f"columns: trailing/leading QR diagonal = "
+            f"{trailing / leading if leading else 0.0:.3e}, requested tolerance = "
+            f"{rank_tolerance:.3e}"
+        )
+    return np.asarray(pivots[:num_wann], dtype=np.int64), pivot_diagonal
+
+
+def _orthonormalize_scdm_projection(
+    projection: np.ndarray,
+    rank_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the unitary polar factor of an SCDM projection matrix.
+
+    This is the same SVD step used by ``pw2wannier90``: for a rectangular
+    matrix ``A = U S Vh``, Wannier90 receives ``U Vh``. Besides removing
+    arbitrary real-space-grid normalization, this gives orthonormal columns
+    at every k-point.
+    """
+
+    matrix = np.asarray(projection, dtype=np.complex128)
+    if matrix.ndim != 2:
+        raise ValueError("The SCDM projection matrix must be two-dimensional")
+    if matrix.shape[0] < matrix.shape[1]:
+        raise ValueError(
+            "The SCDM projection matrix must have at least as many bands as "
+            "Wannier functions"
+        )
+    if not np.isfinite(matrix).all():
+        raise ValueError("The SCDM projection matrix must be finite")
+
+    left, singular_values, right = np.linalg.svd(matrix, full_matrices=False)
+    leading = float(singular_values[0]) if singular_values.size else 0.0
+    trailing = float(singular_values[-1]) if singular_values.size else 0.0
+    if leading == 0.0 or trailing <= rank_tolerance * leading:
+        raise ValueError(
+            "The SCDM projection is rank deficient: trailing/leading singular "
+            f"value = {trailing / leading if leading else 0.0:.3e}, requested "
+            f"tolerance = {rank_tolerance:.3e}"
+        )
+    return np.asfortranarray(left @ right), singular_values
+
+
 @dataclass(frozen=True)
 class SymmetryData:
     """Wannier90 ``.dmn`` data, using zero-based Python indices.
@@ -1368,6 +1485,14 @@ class W90:
         "atoms_cart",
         "atoms_frac",
         "distk",
+        "scdm_proj",
+        "scdm_entanglement",
+        "scdm_mu",
+        "scdm_sigma",
+        "scdm_grid",
+        "scdm_anchor_kpoint",
+        "scdm_chunk_size",
+        "scdm_rank_tolerance",
     }
 
     def __init__(
@@ -1386,6 +1511,14 @@ class W90:
         projections: Sequence[str] | None = None,
         exclude_bands: Sequence[int] | None = None,
         use_bloch_phases: bool = False,
+        scdm_proj: bool = False,
+        scdm_entanglement: str = "erfc",
+        scdm_mu: float | None = None,
+        scdm_sigma: float | None = None,
+        scdm_grid: Sequence[int] | None = None,
+        scdm_anchor_kpoint: int | None = None,
+        scdm_chunk_size: int = 20_000,
+        scdm_rank_tolerance: float = 1.0e-10,
         options: Mapping[str, Any] | None = None,
         mpi_comm: Any | None = None,
         kpoint_distribution: Sequence[int] | None = None,
@@ -1439,6 +1572,25 @@ class W90:
             excluded = [int(excluded)]
         self.requested_exclude_bands = np.asarray(excluded, dtype=np.int32)
         self.use_bloch_phases = bool(use_bloch_phases or legacy_bloch)
+        self.scdm_proj = bool(scdm_proj)
+        self.scdm_entanglement = str(scdm_entanglement).lower()
+        self.scdm_mu = None if scdm_mu is None else float(scdm_mu)
+        self.scdm_sigma = None if scdm_sigma is None else float(scdm_sigma)
+        self.scdm_anchor_kpoint = (
+            None if scdm_anchor_kpoint is None else int(scdm_anchor_kpoint)
+        )
+        self.scdm_chunk_size = int(scdm_chunk_size)
+        self.scdm_rank_tolerance = float(scdm_rank_tolerance)
+        if self.scdm_proj and self.projections:
+            raise ValueError("SCDM initialization cannot be combined with explicit projections")
+        if self.scdm_proj and self.use_bloch_phases:
+            raise ValueError("SCDM initialization cannot be combined with use_bloch_phases")
+        if self.scdm_proj and bool(self.options.get("guiding_centres", False)):
+            raise ValueError("SCDM initialization does not define guiding centres")
+        if self.scdm_chunk_size < 1:
+            raise ValueError("scdm_chunk_size must be positive")
+        if not np.isfinite(self.scdm_rank_tolerance) or self.scdm_rank_tolerance <= 0.0:
+            raise ValueError("scdm_rank_tolerance must be positive and finite")
 
         self.kpts = np.asarray(kmf.kpts, dtype=np.float64)
         if self.kpts.ndim == 1:
@@ -1448,6 +1600,31 @@ class W90:
             raise ValueError(
                 f"PySCF has {self.num_kpts} k-points but mp_grid contains "
                 f"{int(np.prod(self.mp_grid))} points"
+            )
+        if self.scdm_anchor_kpoint is not None and not (
+            0 <= self.scdm_anchor_kpoint < self.num_kpts
+        ):
+            raise ValueError(
+                f"scdm_anchor_kpoint must lie in [0, {self.num_kpts - 1}]"
+            )
+        if self.scdm_proj:
+            # Validate the mode and erfc parameters before native setup.
+            scdm_weights(
+                np.zeros(1),
+                self.scdm_entanglement,
+                self.scdm_mu,
+                self.scdm_sigma,
+            )
+        if scdm_grid is None:
+            self.scdm_grid = np.asarray(getattr(cell, "mesh", ()), dtype=np.int32)
+        else:
+            self.scdm_grid = np.asarray(scdm_grid, dtype=np.int32)
+        if self.scdm_proj and (
+            self.scdm_grid.shape != (3,) or np.any(self.scdm_grid <= 0)
+        ):
+            raise ValueError(
+                "scdm_grid must contain three positive integers, or the PySCF "
+                "cell must define a three-dimensional mesh"
             )
 
         from pyscf.data import nist
@@ -1482,6 +1659,11 @@ class W90:
         self.band_included_list: list[int] = []
         self.num_bands: int | None = None
         self.projection_data: dict[str, np.ndarray] | None = None
+        self.scdm_selected_grid_indices: np.ndarray | None = None
+        self.scdm_selected_grid_coordinates: np.ndarray | None = None
+        self.scdm_pivot_diagonal: np.ndarray | None = None
+        self.scdm_projection_singular_values: np.ndarray | None = None
+        self.scdm_anchor_index: int | None = None
 
         self.M_matrix: np.ndarray | None = None
         self.M_matrix_local: np.ndarray | None = None
@@ -1689,7 +1871,12 @@ class W90:
             library.set_option("use_bloch_phases", self.use_bloch_phases)
             if self.requested_exclude_bands.size:
                 library.set_option("exclude_bands", self.requested_exclude_bands)
-            if self.projections:
+            if self.scdm_proj:
+                # The v4 input parser still requires a projection record. It
+                # is only a structural placeholder: get_scdm_A_mat replaces
+                # the attached A matrix before native disentanglement.
+                library.set_option("projections", ["random"])
+            elif self.projections:
                 library.set_option("projections", self.projections)
             elif self.use_bloch_phases:
                 # input_setopt still validates that an initial projection set
@@ -1718,7 +1905,7 @@ class W90:
             self.num_bands = len(self.band_included_list)
             if self.num_bands < self.num_wann:
                 raise Wannier90Error("Fewer included bands than requested Wannier functions")
-            if not self.use_bloch_phases:
+            if not self.use_bloch_phases and not self.scdm_proj:
                 self.projection_data = library.get_projections()
                 if self.projection_data["l"].size != self.num_wann:
                     raise NotImplementedError(
@@ -1767,6 +1954,8 @@ class W90:
     def get_A_mat(self) -> np.ndarray:
         if self.num_bands is None:
             raise RuntimeError("Call setup() before constructing the A matrix")
+        if self.scdm_proj:
+            return self.get_scdm_A_mat()
         result = np.zeros(
             (self.num_bands, self.num_wann, self.num_kpts),
             dtype=np.complex128,
@@ -1808,6 +1997,193 @@ class W90:
                     "v,vu,um->m", ao_projector, overlap, coefficients, optimize=True
                 ).conj()
         return result
+
+    def _evaluate_bloch_wavefunctions(
+        self, coordinates: np.ndarray, kpoint_index: int
+    ) -> np.ndarray:
+        """Evaluate included PySCF Bloch orbitals at Cartesian Bohr points.
+
+        PySCF's k-point AO evaluator includes the Bloch phase. That is the
+        convention needed for the all-k SCDM projection. Column selection is
+        restricted to Gamma below, where the Bloch and cell-periodic parts
+        coincide.
+        """
+
+        from pyscf.pbc.dft import numint
+
+        ao_values = numint.eval_ao(
+            self.cell,
+            np.asarray(coordinates, dtype=np.float64),
+            kpt=self.kpts[kpoint_index],
+        )
+        coefficients = self.mo_coeff[kpoint_index][:, self.band_included_list]
+        return np.asarray(ao_values, dtype=np.complex128) @ coefficients
+
+    def _build_scdm_A_mat(self) -> np.ndarray:
+        """Construct SCDM-k projections on the root process."""
+
+        if self.num_bands is None:
+            raise RuntimeError("Call setup() before constructing the SCDM A matrix")
+        if self.scdm_entanglement == "isolated" and self.num_bands != self.num_wann:
+            raise ValueError(
+                "scdm_entanglement='isolated' requires num_bands == num_wann; "
+                "use 'erfc' for an entangled outer space"
+            )
+
+        energies_ev = self.mo_energy[:, self.band_included_list] * self.hartree_to_ev
+        weights = scdm_weights(
+            energies_ev,
+            self.scdm_entanglement,
+            self.scdm_mu,
+            self.scdm_sigma,
+        )
+        if self.scdm_anchor_kpoint is None:
+            # Account for reciprocal-lattice-equivalent integer coordinates.
+            reduced = self.kpt_latt - np.rint(self.kpt_latt)
+            anchor_index = int(np.argmin(np.linalg.norm(reduced, axis=1)))
+        else:
+            anchor_index = self.scdm_anchor_kpoint
+        anchor_reduced = self.kpt_latt[anchor_index] - np.rint(
+            self.kpt_latt[anchor_index]
+        )
+        if np.linalg.norm(anchor_reduced) >= 1.0e-8:
+            raise ValueError(
+                "SCDM-k column selection requires a Gamma-centred k-point mesh; "
+                "no Gamma point was selected"
+            )
+
+        coordinates = np.asarray(
+            self.cell.get_uniform_grids(self.scdm_grid), dtype=np.float64
+        )
+        if coordinates.ndim != 2 or coordinates.shape[1] != 3:
+            raise ValueError("PySCF returned an invalid uniform grid for SCDM")
+        if coordinates.shape[0] < self.num_wann:
+            raise ValueError("The SCDM real-space grid has fewer points than num_wann")
+
+        weighted_anchor = np.empty(
+            (self.num_bands, coordinates.shape[0]),
+            dtype=np.complex128,
+            order="F",
+        )
+        for start in range(0, coordinates.shape[0], self.scdm_chunk_size):
+            stop = min(start + self.scdm_chunk_size, coordinates.shape[0])
+            wavefunctions = self._evaluate_bloch_wavefunctions(
+                coordinates[start:stop], anchor_index
+            )
+            weighted_anchor[:, start:stop] = (
+                weights[anchor_index, :, None] * wavefunctions.conj().T
+            )
+
+        selected, pivot_diagonal = _pivot_scdm_columns(
+            weighted_anchor,
+            self.num_wann,
+            self.scdm_rank_tolerance,
+        )
+        selected_coordinates = coordinates[selected]
+        result = np.empty(
+            (self.num_bands, self.num_wann, self.num_kpts),
+            dtype=np.complex128,
+            order="F",
+        )
+        all_singular_values = np.empty(
+            (self.num_kpts, self.num_wann), dtype=np.float64
+        )
+        for kpoint_index in range(self.num_kpts):
+            wavefunctions = self._evaluate_bloch_wavefunctions(
+                selected_coordinates, kpoint_index
+            )
+            raw_projection = (
+                weights[kpoint_index, :, None] * wavefunctions.conj().T
+            )
+            result[:, :, kpoint_index], singular_values = (
+                _orthonormalize_scdm_projection(
+                    raw_projection,
+                    self.scdm_rank_tolerance,
+                )
+            )
+            all_singular_values[kpoint_index] = singular_values
+
+        self.scdm_selected_grid_indices = selected
+        self.scdm_selected_grid_coordinates = selected_coordinates
+        self.scdm_pivot_diagonal = pivot_diagonal
+        self.scdm_projection_singular_values = all_singular_values
+        self.scdm_anchor_index = anchor_index
+        if int(self.options.get("iprint", 1)) > 0:
+            qrcp_ratio = float(pivot_diagonal[-1] / pivot_diagonal[0])
+            svd_ratio = float(
+                np.min(all_singular_values[:, -1] / all_singular_values[:, 0])
+            )
+            description = f"{self.scdm_entanglement} weighting"
+            if self.scdm_entanglement in {"erfc", "gaussian"}:
+                description += (
+                    f", mu={self.scdm_mu:.8g} eV, "
+                    f"sigma={self.scdm_sigma:.8g} eV"
+                )
+            print(
+                "SCDM-k initializer: "
+                f"{description}; anchor k-point={anchor_index}; "
+                f"grid={tuple(int(value) for value in self.scdm_grid)}; "
+                f"QR trailing/leading diagonal={qrcp_ratio:.3e}; "
+                f"minimum SVD trailing/leading ratio={svd_ratio:.3e}",
+                flush=True,
+            )
+        return result
+
+    def get_scdm_A_mat(self) -> np.ndarray:
+        """Return a replicated SCDM-k projection matrix for Wannier90."""
+
+        if not self.scdm_proj:
+            raise RuntimeError("Construct W90 with scdm_proj=True to use SCDM")
+        if not self.is_mpi:
+            return self._build_scdm_A_mat()
+        communicator = self.mpi_comm
+        if communicator is None or not hasattr(communicator, "bcast"):
+            raise TypeError("MPI SCDM setup requires communicator.bcast")
+
+        failure: tuple[str, str] | None = None
+        payload: tuple[
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            int,
+        ] | None = None
+        if self.mpi_rank == 0:
+            try:
+                matrix = self._build_scdm_A_mat()
+                if (
+                    self.scdm_selected_grid_indices is None
+                    or self.scdm_selected_grid_coordinates is None
+                    or self.scdm_pivot_diagonal is None
+                    or self.scdm_projection_singular_values is None
+                    or self.scdm_anchor_index is None
+                ):
+                    raise RuntimeError("SCDM diagnostics were not populated")
+                payload = (
+                    matrix,
+                    self.scdm_selected_grid_indices,
+                    self.scdm_selected_grid_coordinates,
+                    self.scdm_pivot_diagonal,
+                    self.scdm_projection_singular_values,
+                    self.scdm_anchor_index,
+                )
+            except Exception as exc:
+                failure = (type(exc).__name__, str(exc))
+        failure, payload = communicator.bcast((failure, payload), root=0)
+        if failure is not None:
+            raise ValueError(f"Rank-0 SCDM setup failed ({failure[0]}): {failure[1]}")
+        if payload is None:
+            raise RuntimeError("Rank 0 did not broadcast an SCDM A matrix")
+        (
+            matrix,
+            self.scdm_selected_grid_indices,
+            self.scdm_selected_grid_coordinates,
+            self.scdm_pivot_diagonal,
+            self.scdm_projection_singular_values,
+            self.scdm_anchor_index,
+        ) = payload
+        return np.asfortranarray(matrix, dtype=np.complex128)
 
     def get_epsilon_mat(self) -> np.ndarray:
         if not self.band_included_list:

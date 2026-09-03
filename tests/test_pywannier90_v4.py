@@ -23,9 +23,12 @@ from pywannier90_v4 import (
     Wannier90V4Library,
     _W90Data,
     _default_kpoint_distribution,
+    _orthonormalize_scdm_projection,
     _parse_legacy_keywords,
+    _pivot_scdm_columns,
     build_symmetry_data,
     projection_function,
+    scdm_weights,
     symmetrize_projection_matrix,
     validate_symmetry_data,
     write_dmn,
@@ -75,6 +78,116 @@ class LegacyKeywordTests(unittest.TestCase):
         self.assertEqual(parsed["projections"], ["H:s"])
         self.assertFalse(parsed["use_bloch_phases"])
         self.assertAlmostEqual(parsed["sp_en_mix"], 0.5)
+
+
+class SCDMTests(unittest.TestCase):
+    def test_erfc_weights_use_electron_volts(self):
+        values = scdm_weights(
+            np.array([8.0, 10.0, 12.0]),
+            "erfc",
+            mu_ev=10.0,
+            sigma_ev=2.0,
+        )
+        self.assertAlmostEqual(values[1], 0.5)
+        self.assertGreater(values[0], 0.9)
+        self.assertLess(values[2], 0.1)
+
+    def test_gaussian_weights_match_pw2wannier90_definition(self):
+        values = scdm_weights(
+            np.array([8.0, 10.0, 12.0]),
+            "gaussian",
+            mu_ev=10.0,
+            sigma_ev=2.0,
+        )
+        np.testing.assert_allclose(values, [np.exp(-1.0), 1.0, np.exp(-1.0)])
+
+    def test_qrcp_rejects_rank_deficient_initializer(self):
+        matrix = np.array([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]])
+        with self.assertRaisesRegex(ValueError, "do not span"):
+            _pivot_scdm_columns(matrix, num_wann=2, rank_tolerance=1.0e-10)
+
+    def test_svd_step_orthonormalizes_projection_columns(self):
+        raw = np.array(
+            [[2.0, 1.0j], [0.5, 3.0], [1.0 - 0.5j, -0.25]],
+            dtype=np.complex128,
+        )
+        projection, singular_values = _orthonormalize_scdm_projection(
+            raw, rank_tolerance=1.0e-10
+        )
+        np.testing.assert_allclose(
+            projection.conj().T @ projection,
+            np.eye(2),
+            atol=1.0e-13,
+        )
+        self.assertEqual(singular_values.shape, (2,))
+
+    def test_adapter_builds_A_from_common_real_space_columns(self):
+        class Cell:
+            grid = np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [3.0, 0.0, 0.0],
+                ]
+            )
+
+            def get_uniform_grids(self, mesh):
+                np.testing.assert_array_equal(mesh, [4, 1, 1])
+                return self.grid
+
+        wavefunctions = np.array(
+            [
+                [[2.0, 0.0], [0.0, 3.0], [0.1, 0.1], [0.0, 0.0]],
+                [[1.0, 0.0], [0.0, 1.0], [0.2, 0.2], [0.0, 0.0]],
+            ],
+            dtype=np.complex128,
+        )
+        adapter = object.__new__(W90)
+        adapter.cell = Cell()
+        adapter.num_bands = 2
+        adapter.num_wann = 2
+        adapter.num_kpts = 2
+        adapter.band_included_list = [0, 1]
+        adapter.mo_energy = np.zeros((2, 2))
+        adapter.hartree_to_ev = 1.0
+        adapter.kpt_latt = np.array([[0.5, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        adapter.scdm_entanglement = "isolated"
+        adapter.scdm_mu = None
+        adapter.scdm_sigma = None
+        adapter.scdm_anchor_kpoint = None
+        adapter.scdm_grid = np.array([4, 1, 1])
+        adapter.scdm_chunk_size = 2
+        adapter.scdm_rank_tolerance = 1.0e-10
+        adapter.options = {"iprint": 0}
+        adapter.scdm_proj = True
+        adapter.is_mpi = False
+        adapter.scdm_selected_grid_indices = None
+        adapter.scdm_selected_grid_coordinates = None
+        adapter.scdm_pivot_diagonal = None
+        adapter.scdm_projection_singular_values = None
+        adapter.scdm_anchor_index = None
+
+        def evaluate(coordinates, kpoint_index):
+            indices = np.asarray(coordinates[:, 0], dtype=int)
+            return wavefunctions[kpoint_index, indices]
+
+        adapter._evaluate_bloch_wavefunctions = evaluate
+        matrix = adapter.get_scdm_A_mat()
+        self.assertEqual(adapter.scdm_anchor_index, 1)
+        self.assertEqual(set(adapter.scdm_selected_grid_indices), {0, 1})
+        for kpoint_index in range(2):
+            selected = adapter.scdm_selected_grid_indices
+            raw = wavefunctions[kpoint_index, selected].conj().T
+            expected, _ = _orthonormalize_scdm_projection(raw, 1.0e-10)
+            np.testing.assert_allclose(matrix[:, :, kpoint_index], expected)
+            np.testing.assert_allclose(
+                matrix[:, :, kpoint_index].conj().T
+                @ matrix[:, :, kpoint_index],
+                np.eye(2),
+                atol=1.0e-13,
+            )
+        self.assertTrue(matrix.flags.f_contiguous)
 
 
 class MPISupportTests(unittest.TestCase):
